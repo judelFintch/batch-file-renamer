@@ -1,115 +1,133 @@
 # batch-file-renamer
 
-Python CLI tool to rename scanned files with an acronym and a sequence number.
+Python tool to rename scanned files with an acronym and an automatic sequence.
 
-## Use Case
+## What It Does
 
-If you scan documents as `.pdf` or `.png`, you can rename them automatically with short codes such as:
+The project now includes:
+
+- a graphical interface to choose the scanner folder
+- saved settings so the selected folder is remembered
+- automatic monitoring of the folder
+- automatic renaming of new scanned files
+- CLI support if you still want to run it from the terminal
+
+Example output names:
 
 ```text
 FAC_001.pdf
 FAC_002.png
 CLI_003.pdf
-ORD_004.png
 ```
-
-This is useful when you want acronyms instead of full names like `Facture_001.pdf`.
 
 ## Supported Files
 
-By default, the script renames:
+By default, the app watches and renames:
 
 - `.pdf`
 - `.png`
 
-You can also choose other extensions with `--extensions`.
+You can change the extensions list from the GUI or the CLI.
 
-## Basic Usage
+## Graphical Interface
 
-```bash
-python3 index.py /path/to/folder --code FAC
-```
-
-Example:
+Start the app:
 
 ```bash
-python3 index.py ~/Desktop/scans --code FAC
+python3 index.py
 ```
 
-This can produce names like:
-
-```text
-FAC_001.pdf
-FAC_002.png
-FAC_003.pdf
-```
-
-## Using Acronyms
-
-Use `--code` to define the acronym:
+Or explicitly:
 
 ```bash
-python3 index.py ~/Desktop/scans --code FAC
-python3 index.py ~/Desktop/scans --code CLI
-python3 index.py ~/Desktop/scans --code ORD
+python3 index.py --gui
 ```
 
-Examples:
+The interface lets you:
 
-- `FAC` for facture
-- `CLI` for client
-- `ORD` for ordonnance
-- `BL` for bon de livraison
+- browse and select the folder used by the scanner
+- enter an acronym such as `FAC`, `CLI`, `ORD`, `BL`
+- define the allowed extensions
+- save the settings
+- rename current files immediately
+- start or stop automatic monitoring
 
-The script automatically converts the code to uppercase.
+## Saved Folder and Settings
 
-## Connect Your Folder Directly
+When you select a folder and save the settings, the app stores:
 
-If you always use the same folder, save it once:
+- the default folder
+- the acronym
+- the extensions list
 
-```bash
-python3 index.py ~/Desktop/scans --save-folder --dry-run
-```
-
-After that, you can run the script without giving the folder again:
-
-```bash
-python3 index.py --code FAC
-```
-
-The default folder is saved in:
+These settings are saved in:
 
 ```text
 .batch_renamer.json
 ```
 
-## Command Options
+The next time you open the app, it reloads the saved folder and starts monitoring it automatically if the folder still exists.
 
-```bash
-python3 index.py [folder] [--code CODE] [--start NUMBER] [--extensions LIST] [--save-folder] [--dry-run]
+## Automatic Detection
+
+The GUI checks the selected folder every few seconds.
+
+When a new scan appears:
+
+1. the app waits until the file size stops changing
+2. it considers the file stable
+3. it renames it automatically
+
+This avoids renaming a file while the scanner is still writing it.
+
+## Naming Format
+
+The app renames files like this:
+
+```text
+CODE_001.ext
+CODE_002.ext
+CODE_003.ext
 ```
 
-Options:
+Examples:
 
-- `folder`: folder containing the files to rename
-- `--code`: acronym for the new filenames, default is `FAC`
-- `--start`: first number in the sequence, default is `1`
-- `--extensions`: comma-separated extensions, default is `pdf,png`
-- `--save-folder`: saves the folder as the default folder
-- `--dry-run`: preview mode, no file is changed
+- `FAC_001.pdf`
+- `FAC_002.png`
+- `CLI_003.pdf`
 
-## Examples
+The original extension is preserved.
 
-Preview the rename operations:
+## Basic GUI Workflow
+
+1. Run `python3 index.py`
+2. Click `Browse`
+3. Select the folder where your scanner saves files
+4. Enter your acronym, for example `FAC`
+5. Click `Save settings`
+6. Click `Rename now` for existing files if needed
+7. Leave monitoring enabled for future scans
+
+## CLI Usage
+
+You can still use the terminal mode.
+
+Basic command:
+
+```bash
+python3 index.py /path/to/folder --code FAC
+```
+
+If a default folder is already saved:
+
+```bash
+python3 index.py --code FAC
+```
+
+Preview only:
 
 ```bash
 python3 index.py ~/Desktop/scans --code FAC --dry-run
-```
-
-Start from `25`:
-
-```bash
-python3 index.py ~/Desktop/scans --code FAC --start 25
 ```
 
 Rename only PNG files:
@@ -118,36 +136,46 @@ Rename only PNG files:
 python3 index.py ~/Desktop/scans --code IMG --extensions png
 ```
 
-Rename PDF and JPG files:
+Save a default folder from the CLI:
 
 ```bash
-python3 index.py ~/Desktop/scans --code DOC --extensions pdf,jpg,jpeg
+python3 index.py ~/Desktop/scans --code FAC --save-folder --dry-run
 ```
 
-Use the saved folder:
+## CLI Options
 
 ```bash
-python3 index.py --code CLI --dry-run
+python3 index.py [folder] [--code CODE] [--start NUMBER] [--extensions LIST] [--save-folder] [--dry-run] [--gui]
 ```
 
-## How It Works
+Options:
 
-1. The script takes the folder you pass, or the saved default folder.
+- `folder`: folder containing the files to rename
+- `--code`: acronym for the new filenames
+- `--start`: first number in the sequence for CLI batch renaming
+- `--extensions`: comma-separated extensions such as `pdf,png,jpg`
+- `--save-folder`: save the folder and current settings
+- `--dry-run`: preview mode, no file is changed
+- `--gui`: launch the graphical interface
+
+## How Renaming Works
+
+1. The app loads the saved settings or the values you enter.
 2. It filters files by extension.
-3. It sorts them alphabetically.
-4. It creates names like `CODE_001.ext`.
-5. It checks for naming conflicts before changing anything.
-6. It renames files through temporary names to avoid collisions.
+3. It ignores files already named like `CODE_001`.
+4. It finds the next available number for the selected acronym.
+5. It renames new files safely through temporary names.
 
-## Safety
+## Safety Notes
 
-- Existing target files stop the process before renaming starts
-- Unsupported files are ignored
-- `--dry-run` lets you verify before applying changes
+- Existing target files block the operation before changes are applied
+- Files already using the numbered acronym format are ignored by the watcher
+- Unsupported extensions are ignored
 - The original extension is preserved
 
-## Notes
+## Requirements
 
-- The script does not scan subfolders
-- The numbering format is fixed to three digits: `001`, `002`, `003`
-- No external library is required
+- Python 3
+- `tkinter` available in your Python installation
+
+No external dependency is required.

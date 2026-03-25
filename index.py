@@ -1,9 +1,31 @@
 import argparse
 import json
+import re
+import sys
 from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, scrolledtext
+except ModuleNotFoundError as exc:
+    tk = None
+    filedialog = None
+    messagebox = None
+    scrolledtext = None
+    TK_IMPORT_ERROR = exc
+else:
+    TK_IMPORT_ERROR = None
 
 
 CONFIG_FILE = Path(__file__).with_name(".batch_renamer.json")
+DEFAULT_CODE = "FAC"
+DEFAULT_EXTENSIONS = "pdf,png"
+MONITOR_INTERVAL_MS = 2000
+NUMBERED_NAME_PATTERN = re.compile(r"^(?P<code>[A-Z0-9]+)_(?P<number>\d+)$")
+
+
+RenamePlan = List[Tuple[Path, Path]]
 
 
 def parse_args():
@@ -19,8 +41,8 @@ def parse_args():
         "--code",
         "--prefix",
         dest="code",
-        default="FAC",
-        help="Acronym used for renamed files (default: FAC)",
+        default=None,
+        help=f"Acronym used for renamed files (default: {DEFAULT_CODE})",
     )
     parser.add_argument(
         "--start",
@@ -30,8 +52,8 @@ def parse_args():
     )
     parser.add_argument(
         "--extensions",
-        default="pdf,png",
-        help="Comma-separated list of extensions to rename (default: pdf,png)",
+        default=None,
+        help=f"Comma-separated list of extensions to rename (default: {DEFAULT_EXTENSIONS})",
     )
     parser.add_argument(
         "--save-folder",
@@ -43,13 +65,42 @@ def parse_args():
         action="store_true",
         help="Preview the rename operations without changing files",
     )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Launch the graphical interface",
+    )
     return parser.parse_args()
 
 
-def normalize_extensions(raw_extensions: str):
+def load_config() -> Dict[str, str]:
+    if not CONFIG_FILE.exists():
+        return {}
+
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_config(config: Dict[str, str]):
+    CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def normalize_code(raw_code: Optional[str]) -> str:
+    code = (raw_code or DEFAULT_CODE).strip().upper()
+    if not code:
+        raise ValueError("The acronym cannot be empty.")
+    if not re.fullmatch(r"[A-Z0-9]+", code):
+        raise ValueError("The acronym must contain only letters and numbers.")
+    return code
+
+
+def normalize_extensions(raw_extensions: Optional[str]) -> Set[str]:
+    source = raw_extensions or DEFAULT_EXTENSIONS
     extensions = set()
 
-    for ext in raw_extensions.split(","):
+    for ext in source.split(","):
         cleaned = ext.strip().lower().lstrip(".")
         if cleaned:
             extensions.add(f".{cleaned}")
@@ -60,36 +111,31 @@ def normalize_extensions(raw_extensions: str):
     return extensions
 
 
-def load_default_folder():
-    if not CONFIG_FILE.exists():
-        return None
-
-    config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    folder = config.get("default_folder")
-    return Path(folder).expanduser() if folder else None
+def format_extensions(extensions: Iterable[str]) -> str:
+    return ",".join(sorted(ext.lstrip(".") for ext in extensions))
 
 
-def save_default_folder(folder: Path):
-    CONFIG_FILE.write_text(
-        json.dumps({"default_folder": str(folder)}, indent=2),
-        encoding="utf-8",
-    )
-
-
-def resolve_folder(folder_arg: str | None):
+def resolve_folder(folder_arg: Optional[str], config: Dict[str, str]) -> Path:
     if folder_arg:
         return Path(folder_arg).expanduser()
 
-    default_folder = load_default_folder()
+    default_folder = config.get("default_folder")
     if default_folder:
-        return default_folder
+        return Path(default_folder).expanduser()
 
     raise ValueError(
-        "No folder provided. Pass a folder path or save one with --save-folder."
+        "No folder provided. Pass a folder path, save one with --save-folder, or launch the GUI."
     )
 
 
-def collect_files(folder: Path, allowed_extensions):
+def ensure_valid_folder(folder: Path):
+    if not folder.exists():
+        raise FileNotFoundError(f"Folder not found: {folder}")
+    if not folder.is_dir():
+        raise NotADirectoryError(f"Not a folder: {folder}")
+
+
+def collect_files(folder: Path, allowed_extensions: Set[str]) -> List[Path]:
     return sorted(
         [
             item
@@ -100,7 +146,27 @@ def collect_files(folder: Path, allowed_extensions):
     )
 
 
-def build_rename_plan(files, code: str, start: int):
+def is_numbered_name(file_path: Path) -> bool:
+    return NUMBERED_NAME_PATTERN.fullmatch(file_path.stem) is not None
+
+
+def next_sequence_number(
+    folder: Path,
+    code: str,
+    allowed_extensions: Set[str],
+    minimum: int = 1,
+) -> int:
+    highest = minimum - 1
+
+    for file_path in collect_files(folder, allowed_extensions):
+        match = NUMBERED_NAME_PATTERN.fullmatch(file_path.stem)
+        if match and match.group("code") == code:
+            highest = max(highest, int(match.group("number")))
+
+    return highest + 1
+
+
+def build_rename_plan(files: Sequence[Path], code: str, start: int) -> RenamePlan:
     plan = []
 
     for offset, file_path in enumerate(files, start=start):
@@ -110,7 +176,7 @@ def build_rename_plan(files, code: str, start: int):
     return plan
 
 
-def validate_plan(plan):
+def validate_plan(plan: RenamePlan):
     targets = [new_path.name for _, new_path in plan]
 
     if len(targets) != len(set(targets)):
@@ -126,17 +192,15 @@ def validate_plan(plan):
             )
 
 
-def apply_plan(plan, dry_run: bool):
+def apply_plan(plan: RenamePlan, dry_run: bool) -> List[str]:
     if not plan:
-        print("No matching files found.")
-        return
+        return ["No matching files found."]
 
-    for old_path, new_path in plan:
-        print(f"{old_path.name} -> {new_path.name}")
+    logs = [f"{old_path.name} -> {new_path.name}" for old_path, new_path in plan]
 
     if dry_run:
-        print("Dry run completed. No files were renamed.")
-        return
+        logs.append("Dry run completed. No files were renamed.")
+        return logs
 
     temporary_paths = []
 
@@ -150,29 +214,294 @@ def apply_plan(plan, dry_run: bool):
     for temp_path, (_, new_path) in zip(temporary_paths, plan):
         temp_path.rename(new_path)
 
-    print("Renaming completed.")
+    logs.append("Renaming completed.")
+    return logs
 
 
-def main():
-    args = parse_args()
-    folder = resolve_folder(args.folder)
-    allowed_extensions = normalize_extensions(args.extensions)
+def collect_pending_files(folder: Path, allowed_extensions: Set[str]) -> List[Path]:
+    return [file_path for file_path in collect_files(folder, allowed_extensions) if not is_numbered_name(file_path)]
 
-    if not folder.exists():
-        raise FileNotFoundError(f"Folder not found: {folder}")
-    if not folder.is_dir():
-        raise NotADirectoryError(f"Not a folder: {folder}")
+
+def rename_files(
+    folder: Path,
+    code: str,
+    allowed_extensions: Set[str],
+    start: Optional[int] = None,
+    dry_run: bool = False,
+    files: Optional[Sequence[Path]] = None,
+) -> List[str]:
+    ensure_valid_folder(folder)
+    source_files = list(files) if files is not None else collect_pending_files(folder, allowed_extensions)
+
+    if not source_files:
+        return ["No matching files found."]
+
+    starting_number = start if start is not None else next_sequence_number(folder, code, allowed_extensions)
+    plan = build_rename_plan(source_files, code, starting_number)
+    validate_plan(plan)
+    return apply_plan(plan, dry_run)
+
+
+class BatchRenamerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Batch File Renamer")
+        self.root.geometry("760x520")
+
+        self.config = load_config()
+        self.monitoring = False
+        self.monitor_after_id = None
+        self.file_sizes: Dict[str, int] = {}
+
+        self.folder_var = tk.StringVar(value=self.config.get("default_folder", ""))
+        self.code_var = tk.StringVar(value=self.config.get("code", DEFAULT_CODE))
+        self.extensions_var = tk.StringVar(
+            value=self.config.get("extensions", DEFAULT_EXTENSIONS)
+        )
+        self.status_var = tk.StringVar(value="Select a folder to start monitoring.")
+
+        self.build_ui()
+
+        if self.folder_var.get():
+            self.start_monitoring()
+
+    def build_ui(self):
+        self.root.columnconfigure(1, weight=1)
+        self.root.rowconfigure(4, weight=1)
+
+        title = tk.Label(
+            self.root,
+            text="Automatic Scan Renamer",
+            font=("Helvetica", 18, "bold"),
+        )
+        title.grid(row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(16, 8))
+
+        folder_label = tk.Label(self.root, text="Scanner folder")
+        folder_label.grid(row=1, column=0, sticky="w", padx=16, pady=8)
+
+        folder_entry = tk.Entry(self.root, textvariable=self.folder_var)
+        folder_entry.grid(row=1, column=1, sticky="ew", padx=8, pady=8)
+
+        browse_button = tk.Button(self.root, text="Browse", command=self.select_folder)
+        browse_button.grid(row=1, column=2, sticky="ew", padx=(8, 16), pady=8)
+
+        code_label = tk.Label(self.root, text="Acronym")
+        code_label.grid(row=2, column=0, sticky="w", padx=16, pady=8)
+
+        code_entry = tk.Entry(self.root, textvariable=self.code_var)
+        code_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=8)
+
+        ext_label = tk.Label(self.root, text="Extensions")
+        ext_label.grid(row=3, column=0, sticky="w", padx=16, pady=8)
+
+        ext_entry = tk.Entry(self.root, textvariable=self.extensions_var)
+        ext_entry.grid(row=3, column=1, sticky="ew", padx=8, pady=8)
+
+        save_button = tk.Button(self.root, text="Save settings", command=self.save_settings)
+        save_button.grid(row=2, column=2, sticky="ew", padx=(8, 16), pady=8)
+
+        rename_button = tk.Button(self.root, text="Rename now", command=self.rename_now)
+        rename_button.grid(row=3, column=2, sticky="ew", padx=(8, 16), pady=8)
+
+        controls = tk.Frame(self.root)
+        controls.grid(row=4, column=0, columnspan=3, sticky="nsew", padx=16, pady=(8, 16))
+        controls.columnconfigure(0, weight=1)
+        controls.rowconfigure(1, weight=1)
+
+        self.toggle_button = tk.Button(
+            controls,
+            text="Start monitoring",
+            command=self.toggle_monitoring,
+        )
+        self.toggle_button.grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        status_label = tk.Label(
+            controls,
+            textvariable=self.status_var,
+            anchor="w",
+            justify="left",
+        )
+        status_label.grid(row=0, column=0, sticky="ew", padx=(140, 0), pady=(0, 8))
+
+        self.log_text = scrolledtext.ScrolledText(controls, state="disabled", wrap="word")
+        self.log_text.grid(row=1, column=0, sticky="nsew")
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def log(self, message: str):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", f"{message}\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def current_settings(self) -> Tuple[Path, str, Set[str]]:
+        folder = Path(self.folder_var.get()).expanduser()
+        code = normalize_code(self.code_var.get())
+        extensions = normalize_extensions(self.extensions_var.get())
+        ensure_valid_folder(folder)
+        return folder, code, extensions
+
+    def save_settings(self):
+        try:
+            folder, code, extensions = self.current_settings()
+        except Exception as exc:
+            messagebox.showerror("Invalid settings", str(exc))
+            return
+
+        self.config["default_folder"] = str(folder)
+        self.config["code"] = code
+        self.config["extensions"] = format_extensions(extensions)
+        save_config(self.config)
+        self.status_var.set(f"Settings saved for {folder}")
+        self.log(f"Saved folder: {folder}")
+
+    def select_folder(self):
+        selected = filedialog.askdirectory(
+            title="Select the folder where the scanner saves files",
+            initialdir=self.folder_var.get() or str(Path.home()),
+        )
+        if not selected:
+            return
+
+        self.folder_var.set(selected)
+        self.save_settings()
+        if not self.monitoring:
+            self.start_monitoring()
+
+    def rename_now(self):
+        try:
+            folder, code, extensions = self.current_settings()
+            logs = rename_files(folder, code, extensions)
+        except Exception as exc:
+            messagebox.showerror("Rename error", str(exc))
+            self.status_var.set(str(exc))
+            return
+
+        for line in logs:
+            self.log(line)
+        self.status_var.set("Manual rename completed.")
+
+    def toggle_monitoring(self):
+        if self.monitoring:
+            self.stop_monitoring()
+        else:
+            self.start_monitoring()
+
+    def start_monitoring(self):
+        try:
+            folder, _, _ = self.current_settings()
+        except Exception as exc:
+            self.status_var.set(str(exc))
+            return
+
+        self.monitoring = True
+        self.toggle_button.configure(text="Stop monitoring")
+        self.status_var.set(f"Monitoring {folder}")
+        self.log(f"Monitoring started: {folder}")
+        self.schedule_monitor()
+
+    def stop_monitoring(self):
+        self.monitoring = False
+        self.file_sizes.clear()
+        if self.monitor_after_id is not None:
+            self.root.after_cancel(self.monitor_after_id)
+            self.monitor_after_id = None
+        self.toggle_button.configure(text="Start monitoring")
+        self.status_var.set("Monitoring stopped.")
+        self.log("Monitoring stopped.")
+
+    def schedule_monitor(self):
+        if self.monitoring:
+            self.monitor_after_id = self.root.after(MONITOR_INTERVAL_MS, self.monitor_folder)
+
+    def monitor_folder(self):
+        try:
+            folder, code, extensions = self.current_settings()
+            pending_files = collect_pending_files(folder, extensions)
+
+            stable_files = []
+            seen_keys = set()
+
+            for file_path in pending_files:
+                key = str(file_path)
+                size = file_path.stat().st_size
+                previous_size = self.file_sizes.get(key)
+
+                if previous_size is not None and previous_size == size:
+                    stable_files.append(file_path)
+                else:
+                    self.file_sizes[key] = size
+
+                seen_keys.add(key)
+
+            self.file_sizes = {
+                key: size for key, size in self.file_sizes.items() if key in seen_keys
+            }
+
+            if stable_files:
+                logs = rename_files(folder, code, extensions, files=stable_files)
+                for line in logs:
+                    self.log(line)
+                self.status_var.set(f"Detected and renamed {len(stable_files)} new file(s).")
+
+                for file_path in stable_files:
+                    self.file_sizes.pop(str(file_path), None)
+            else:
+                self.status_var.set(f"Monitoring {folder}")
+
+        except Exception as exc:
+            self.status_var.set(f"Monitoring error: {exc}")
+            self.log(f"Monitoring error: {exc}")
+
+        self.schedule_monitor()
+
+    def on_close(self):
+        if self.monitoring:
+            self.stop_monitoring()
+        self.root.destroy()
+
+
+def launch_gui():
+    if tk is None:
+        raise RuntimeError(
+            "Tkinter is not available in this Python installation. Install Python with Tk support to use the GUI."
+        ) from TK_IMPORT_ERROR
+    root = tk.Tk()
+    app = BatchRenamerApp(root)
+    app.root.mainloop()
+
+
+def run_cli(args):
+    config = load_config()
+    code = normalize_code(args.code or config.get("code"))
+    extensions = normalize_extensions(args.extensions or config.get("extensions"))
+    folder = resolve_folder(args.folder, config)
+
+    ensure_valid_folder(folder)
+
     if args.start < 1:
         raise ValueError("--start must be greater than or equal to 1.")
 
     if args.save_folder:
-        save_default_folder(folder)
+        config["default_folder"] = str(folder)
+        config["code"] = code
+        config["extensions"] = format_extensions(extensions)
+        save_config(config)
         print(f"Default folder saved: {folder}")
 
-    files = collect_files(folder, allowed_extensions)
-    plan = build_rename_plan(files, args.code.upper(), args.start)
-    validate_plan(plan)
-    apply_plan(plan, args.dry_run)
+    logs = rename_files(folder, code, extensions, start=args.start, dry_run=args.dry_run)
+    for line in logs:
+        print(line)
+
+
+def main():
+    args = parse_args()
+
+    if args.gui or len(sys.argv) == 1:
+        launch_gui()
+        return
+
+    run_cli(args)
 
 
 if __name__ == "__main__":
