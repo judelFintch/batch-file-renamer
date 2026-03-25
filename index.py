@@ -139,10 +139,12 @@ def collect_files(folder: Path, allowed_extensions: Set[str]) -> List[Path]:
     return sorted(
         [
             item
-            for item in folder.iterdir()
-            if item.is_file() and item.suffix.lower() in allowed_extensions
+            for item in folder.rglob("*")
+            if item.is_file()
+            and item.suffix.lower() in allowed_extensions
+            and not item.name.startswith(".rename_tmp_")
         ],
-        key=lambda item: item.name.lower(),
+        key=lambda item: (str(item.parent).lower(), item.name.lower()),
     )
 
 
@@ -177,7 +179,7 @@ def build_rename_plan(files: Sequence[Path], code: str, start: int) -> RenamePla
 
 
 def validate_plan(plan: RenamePlan):
-    targets = [new_path.name for _, new_path in plan]
+    targets = [str(new_path) for _, new_path in plan]
 
     if len(targets) != len(set(targets)):
         raise ValueError("Duplicate target names detected in the rename plan.")
@@ -252,6 +254,7 @@ class BatchRenamerApp:
         self.monitoring = False
         self.monitor_after_id = None
         self.file_sizes: Dict[str, int] = {}
+        self.preview_files: Dict[str, str] = {}
 
         self.folder_var = tk.StringVar(value=self.config.get("default_folder", ""))
         self.code_var = tk.StringVar(value=self.config.get("code", DEFAULT_CODE))
@@ -306,7 +309,7 @@ class BatchRenamerApp:
         controls = tk.Frame(self.root)
         controls.grid(row=4, column=0, columnspan=3, sticky="nsew", padx=16, pady=(8, 16))
         controls.columnconfigure(0, weight=1)
-        controls.rowconfigure(1, weight=1)
+        controls.rowconfigure(2, weight=1)
 
         self.toggle_button = tk.Button(
             controls,
@@ -323,8 +326,15 @@ class BatchRenamerApp:
         )
         status_label.grid(row=0, column=0, sticky="ew", padx=(140, 0), pady=(0, 8))
 
+        preview_label = tk.Label(controls, text="Preview of detected files")
+        preview_label.grid(row=1, column=0, sticky="w")
+
+        self.preview_text = scrolledtext.ScrolledText(controls, height=8, state="disabled", wrap="word")
+        self.preview_text.grid(row=2, column=0, sticky="nsew", pady=(4, 8))
+
         self.log_text = scrolledtext.ScrolledText(controls, state="disabled", wrap="word")
-        self.log_text.grid(row=1, column=0, sticky="nsew")
+        self.log_text.grid(row=3, column=0, sticky="nsew")
+        controls.rowconfigure(3, weight=1)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -333,6 +343,17 @@ class BatchRenamerApp:
         self.log_text.insert("end", f"{message}\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def set_preview(self, lines: Sequence[str]):
+        self.preview_text.configure(state="normal")
+        self.preview_text.delete("1.0", "end")
+
+        if lines:
+            self.preview_text.insert("end", "\n".join(lines))
+        else:
+            self.preview_text.insert("end", "No new files detected.")
+
+        self.preview_text.configure(state="disabled")
 
     def current_settings(self) -> Tuple[Path, str, Set[str]]:
         folder = Path(self.folder_var.get()).expanduser()
@@ -398,17 +419,20 @@ class BatchRenamerApp:
         self.toggle_button.configure(text="Stop monitoring")
         self.status_var.set(f"Monitoring {folder}")
         self.log(f"Monitoring started: {folder}")
+        self.set_preview([])
         self.schedule_monitor()
 
     def stop_monitoring(self):
         self.monitoring = False
         self.file_sizes.clear()
+        self.preview_files.clear()
         if self.monitor_after_id is not None:
             self.root.after_cancel(self.monitor_after_id)
             self.monitor_after_id = None
         self.toggle_button.configure(text="Start monitoring")
         self.status_var.set("Monitoring stopped.")
         self.log("Monitoring stopped.")
+        self.set_preview([])
 
     def schedule_monitor(self):
         if self.monitoring:
@@ -421,22 +445,28 @@ class BatchRenamerApp:
 
             stable_files = []
             seen_keys = set()
+            preview_map: Dict[str, str] = {}
 
             for file_path in pending_files:
                 key = str(file_path)
                 size = file_path.stat().st_size
                 previous_size = self.file_sizes.get(key)
+                relative_path = str(file_path.relative_to(folder))
 
                 if previous_size is not None and previous_size == size:
                     stable_files.append(file_path)
+                    preview_map[key] = f"[Ready] {relative_path}"
                 else:
                     self.file_sizes[key] = size
+                    preview_map[key] = f"[Writing] {relative_path}"
 
                 seen_keys.add(key)
 
             self.file_sizes = {
                 key: size for key, size in self.file_sizes.items() if key in seen_keys
             }
+            self.preview_files = {key: value for key, value in preview_map.items() if key in seen_keys}
+            self.set_preview([self.preview_files[key] for key in sorted(self.preview_files)])
 
             if stable_files:
                 logs = rename_files(folder, code, extensions, files=stable_files)
@@ -446,6 +476,9 @@ class BatchRenamerApp:
 
                 for file_path in stable_files:
                     self.file_sizes.pop(str(file_path), None)
+                    self.preview_files.pop(str(file_path), None)
+
+                self.set_preview([self.preview_files[key] for key in sorted(self.preview_files)])
             else:
                 self.status_var.set(f"Monitoring {folder}")
 
