@@ -1,22 +1,42 @@
 import argparse
+import json
 from pathlib import Path
+
+
+CONFIG_FILE = Path(__file__).with_name(".batch_renamer.json")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Rename PDF files in a folder using a numbered pattern."
+        description="Rename scanned files with an acronym and numbered pattern."
     )
-    parser.add_argument("folder", help="Path to the folder containing the PDF files")
     parser.add_argument(
+        "folder",
+        nargs="?",
+        help="Path to the folder containing the files to rename",
+    )
+    parser.add_argument(
+        "--code",
         "--prefix",
-        default="Facture",
-        help="Prefix used for renamed files (default: Facture)",
+        dest="code",
+        default="FAC",
+        help="Acronym used for renamed files (default: FAC)",
     )
     parser.add_argument(
         "--start",
         type=int,
         default=1,
         help="Starting number for the sequence (default: 1)",
+    )
+    parser.add_argument(
+        "--extensions",
+        default="pdf,png",
+        help="Comma-separated list of extensions to rename (default: pdf,png)",
+    )
+    parser.add_argument(
+        "--save-folder",
+        action="store_true",
+        help="Save the provided folder as the default folder",
     )
     parser.add_argument(
         "--dry-run",
@@ -26,18 +46,65 @@ def parse_args():
     return parser.parse_args()
 
 
-def collect_pdf_files(folder: Path):
+def normalize_extensions(raw_extensions: str):
+    extensions = set()
+
+    for ext in raw_extensions.split(","):
+        cleaned = ext.strip().lower().lstrip(".")
+        if cleaned:
+            extensions.add(f".{cleaned}")
+
+    if not extensions:
+        raise ValueError("At least one valid extension must be provided.")
+
+    return extensions
+
+
+def load_default_folder():
+    if not CONFIG_FILE.exists():
+        return None
+
+    config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    folder = config.get("default_folder")
+    return Path(folder).expanduser() if folder else None
+
+
+def save_default_folder(folder: Path):
+    CONFIG_FILE.write_text(
+        json.dumps({"default_folder": str(folder)}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def resolve_folder(folder_arg: str | None):
+    if folder_arg:
+        return Path(folder_arg).expanduser()
+
+    default_folder = load_default_folder()
+    if default_folder:
+        return default_folder
+
+    raise ValueError(
+        "No folder provided. Pass a folder path or save one with --save-folder."
+    )
+
+
+def collect_files(folder: Path, allowed_extensions):
     return sorted(
-        [item for item in folder.iterdir() if item.is_file() and item.suffix.lower() == ".pdf"],
+        [
+            item
+            for item in folder.iterdir()
+            if item.is_file() and item.suffix.lower() in allowed_extensions
+        ],
         key=lambda item: item.name.lower(),
     )
 
 
-def build_rename_plan(files, prefix: str, start: int):
+def build_rename_plan(files, code: str, start: int):
     plan = []
 
     for offset, file_path in enumerate(files, start=start):
-        new_name = f"{prefix}_{offset:03}.pdf"
+        new_name = f"{code}_{offset:03}{file_path.suffix.lower()}"
         plan.append((file_path, file_path.with_name(new_name)))
 
     return plan
@@ -61,7 +128,7 @@ def validate_plan(plan):
 
 def apply_plan(plan, dry_run: bool):
     if not plan:
-        print("No PDF files found.")
+        print("No matching files found.")
         return
 
     for old_path, new_path in plan:
@@ -88,7 +155,8 @@ def apply_plan(plan, dry_run: bool):
 
 def main():
     args = parse_args()
-    folder = Path(args.folder).expanduser()
+    folder = resolve_folder(args.folder)
+    allowed_extensions = normalize_extensions(args.extensions)
 
     if not folder.exists():
         raise FileNotFoundError(f"Folder not found: {folder}")
@@ -97,8 +165,12 @@ def main():
     if args.start < 1:
         raise ValueError("--start must be greater than or equal to 1.")
 
-    files = collect_pdf_files(folder)
-    plan = build_rename_plan(files, args.prefix, args.start)
+    if args.save_folder:
+        save_default_folder(folder)
+        print(f"Default folder saved: {folder}")
+
+    files = collect_files(folder, allowed_extensions)
+    plan = build_rename_plan(files, args.code.upper(), args.start)
     validate_plan(plan)
     apply_plan(plan, args.dry_run)
 

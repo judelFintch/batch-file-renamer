@@ -1,137 +1,153 @@
 # batch-file-renamer
 
-A simple Python CLI tool to rename PDF files in batch with a numbered format.
+Python CLI tool to rename scanned files with an acronym and a sequence number.
 
-## Overview
+## Use Case
 
-This script scans a folder, keeps only PDF files, sorts them alphabetically, and renames them using a sequential pattern such as:
+If you scan documents as `.pdf` or `.png`, you can rename them automatically with short codes such as:
 
 ```text
-Facture_001.pdf
-Facture_002.pdf
-Facture_003.pdf
+FAC_001.pdf
+FAC_002.png
+CLI_003.pdf
+ORD_004.png
 ```
 
-It is designed to be safer than a basic one-pass rename script:
+This is useful when you want acronyms instead of full names like `Facture_001.pdf`.
 
-- It only targets `.pdf` files
-- It validates conflicts before changing anything
-- It uses a two-step rename process to avoid filename collisions
-- It provides a preview mode with `--dry-run`
+## Supported Files
 
-## Requirements
+By default, the script renames:
 
-- Python 3.8 or newer
-- A folder containing PDF files to rename
+- `.pdf`
+- `.png`
 
-No external dependency is required.
+You can also choose other extensions with `--extensions`.
 
-## Installation
-
-Clone the repository and run the script directly:
+## Basic Usage
 
 ```bash
-git clone <your-repo-url>
-cd batch-file-renamer
-python3 index.py --help
-```
-
-## Usage
-
-```bash
-python3 index.py /path/to/folder
+python3 index.py /path/to/folder --code FAC
 ```
 
 Example:
 
 ```bash
-python3 index.py ~/Desktop/test_files --prefix Facture --start 1 --dry-run
+python3 index.py ~/Desktop/scans --code FAC
+```
+
+This can produce names like:
+
+```text
+FAC_001.pdf
+FAC_002.png
+FAC_003.pdf
+```
+
+## Using Acronyms
+
+Use `--code` to define the acronym:
+
+```bash
+python3 index.py ~/Desktop/scans --code FAC
+python3 index.py ~/Desktop/scans --code CLI
+python3 index.py ~/Desktop/scans --code ORD
+```
+
+Examples:
+
+- `FAC` for facture
+- `CLI` for client
+- `ORD` for ordonnance
+- `BL` for bon de livraison
+
+The script automatically converts the code to uppercase.
+
+## Connect Your Folder Directly
+
+If you always use the same folder, save it once:
+
+```bash
+python3 index.py ~/Desktop/scans --save-folder --dry-run
+```
+
+After that, you can run the script without giving the folder again:
+
+```bash
+python3 index.py --code FAC
+```
+
+The default folder is saved in:
+
+```text
+.batch_renamer.json
 ```
 
 ## Command Options
 
 ```bash
-python3 index.py <folder> [--prefix PREFIX] [--start NUMBER] [--dry-run]
+python3 index.py [folder] [--code CODE] [--start NUMBER] [--extensions LIST] [--save-folder] [--dry-run]
 ```
-
-Arguments:
-
-- `folder`: path to the directory containing the PDF files
 
 Options:
 
-- `--prefix`: sets the filename prefix, default is `Facture`
-- `--start`: sets the first sequence number, default is `1`
-- `--dry-run`: prints the rename plan without modifying any file
-
-## Features
-
-- Stable alphabetical sorting before renaming
-- Only renames `.pdf` files
-- Collision detection before changes
-- Two-step renaming to avoid filename conflicts
-- `--dry-run` mode to preview operations safely
+- `folder`: folder containing the files to rename
+- `--code`: acronym for the new filenames, default is `FAC`
+- `--start`: first number in the sequence, default is `1`
+- `--extensions`: comma-separated extensions, default is `pdf,png`
+- `--save-folder`: saves the folder as the default folder
+- `--dry-run`: preview mode, no file is changed
 
 ## Examples
 
-Rename all PDF files in a folder with the default prefix:
+Preview the rename operations:
 
 ```bash
-python3 index.py ~/Desktop/test_files
+python3 index.py ~/Desktop/scans --code FAC --dry-run
 ```
 
-Start numbering at `25`:
+Start from `25`:
 
 ```bash
-python3 index.py ~/Desktop/test_files --start 25
+python3 index.py ~/Desktop/scans --code FAC --start 25
 ```
 
-Use a custom prefix:
+Rename only PNG files:
 
 ```bash
-python3 index.py ~/Desktop/test_files --prefix Invoice
+python3 index.py ~/Desktop/scans --code IMG --extensions png
 ```
 
-Preview the result without changing files:
+Rename PDF and JPG files:
 
 ```bash
-python3 index.py ~/Desktop/test_files --dry-run
+python3 index.py ~/Desktop/scans --code DOC --extensions pdf,jpg,jpeg
+```
+
+Use the saved folder:
+
+```bash
+python3 index.py --code CLI --dry-run
 ```
 
 ## How It Works
 
-1. The script checks that the provided path exists and is a directory.
-2. It collects only files ending with `.pdf`.
-3. It sorts them alphabetically in a case-insensitive way.
-4. It builds a rename plan like `Prefix_001.pdf`, `Prefix_002.pdf`, and so on.
-5. It validates that no target filename already exists.
-6. It renames files through temporary names first, then applies final names.
+1. The script takes the folder you pass, or the saved default folder.
+2. It filters files by extension.
+3. It sorts them alphabetically.
+4. It creates names like `CODE_001.ext`.
+5. It checks for naming conflicts before changing anything.
+6. It renames files through temporary names to avoid collisions.
 
-## Example Output
+## Safety
 
-```text
-old_document.pdf -> Facture_001.pdf
-scan_2024.pdf -> Facture_002.pdf
-Dry run completed. No files were renamed.
-```
-
-## Safety Notes
-
-- Non-PDF files are ignored
 - Existing target files stop the process before renaming starts
-- Numbering below `1` is rejected
-- If no PDF file is found, the script exits cleanly with a message
+- Unsupported files are ignored
+- `--dry-run` lets you verify before applying changes
+- The original extension is preserved
 
-## Limitations
+## Notes
 
-- The output format is fixed to `PREFIX_XXX.pdf`
-- It does not recurse into subfolders
-- It does not preserve original filenames
-
-## Project Structure
-
-```text
-batch-file-renamer/
-├── index.py
-└── README.md
-```
+- The script does not scan subfolders
+- The numbering format is fixed to three digits: `001`, `002`, `003`
+- No external library is required
