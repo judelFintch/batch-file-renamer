@@ -224,6 +224,17 @@ def collect_pending_files(folder: Path, allowed_extensions: Set[str]) -> List[Pa
     return [file_path for file_path in collect_files(folder, allowed_extensions) if not is_numbered_name(file_path)]
 
 
+def build_existing_files_preview(folder: Path, allowed_extensions: Set[str]) -> List[str]:
+    preview_lines = []
+
+    for file_path in collect_files(folder, allowed_extensions):
+        relative_path = str(file_path.relative_to(folder))
+        status = "[Named]" if is_numbered_name(file_path) else "[Detected]"
+        preview_lines.append(f"{status} {relative_path}")
+
+    return preview_lines
+
+
 def rename_files(
     folder: Path,
     code: str,
@@ -386,8 +397,9 @@ class BatchRenamerApp:
 
         self.folder_var.set(selected)
         self.save_settings()
-        if not self.monitoring:
-            self.start_monitoring()
+        if self.monitoring:
+            self.stop_monitoring()
+        self.start_monitoring()
 
     def rename_now(self):
         try:
@@ -410,7 +422,7 @@ class BatchRenamerApp:
 
     def start_monitoring(self):
         try:
-            folder, _, _ = self.current_settings()
+            folder, _, extensions = self.current_settings()
         except Exception as exc:
             self.status_var.set(str(exc))
             return
@@ -419,7 +431,7 @@ class BatchRenamerApp:
         self.toggle_button.configure(text="Stop monitoring")
         self.status_var.set(f"Monitoring {folder}")
         self.log(f"Monitoring started: {folder}")
-        self.set_preview([])
+        self.set_preview(build_existing_files_preview(folder, extensions))
         self.schedule_monitor()
 
     def stop_monitoring(self):
@@ -441,11 +453,18 @@ class BatchRenamerApp:
     def monitor_folder(self):
         try:
             folder, code, extensions = self.current_settings()
+            all_files = collect_files(folder, extensions)
             pending_files = collect_pending_files(folder, extensions)
 
             stable_files = []
             seen_keys = set()
             preview_map: Dict[str, str] = {}
+
+            for file_path in all_files:
+                key = str(file_path)
+                relative_path = str(file_path.relative_to(folder))
+                if is_numbered_name(file_path):
+                    preview_map[key] = f"[Named] {relative_path}"
 
             for file_path in pending_files:
                 key = str(file_path)
@@ -465,7 +484,7 @@ class BatchRenamerApp:
             self.file_sizes = {
                 key: size for key, size in self.file_sizes.items() if key in seen_keys
             }
-            self.preview_files = {key: value for key, value in preview_map.items() if key in seen_keys}
+            self.preview_files = preview_map
             self.set_preview([self.preview_files[key] for key in sorted(self.preview_files)])
 
             if stable_files:
