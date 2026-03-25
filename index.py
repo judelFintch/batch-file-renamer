@@ -3,7 +3,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
     import tkinter as tk
@@ -20,7 +20,6 @@ else:
 
 CONFIG_FILE = Path(__file__).with_name(".batch_renamer.json")
 DEFAULT_CODE = "FAC"
-DEFAULT_EXTENSIONS = "pdf,png"
 MONITOR_INTERVAL_MS = 2000
 NUMBERED_NAME_PATTERN = re.compile(r"^(?P<code>[A-Z0-9]+)_(?P<number>\d+)$")
 
@@ -49,11 +48,6 @@ def parse_args():
         type=int,
         default=1,
         help="Starting number for the sequence (default: 1)",
-    )
-    parser.add_argument(
-        "--extensions",
-        default=None,
-        help=f"Comma-separated list of extensions to rename (default: {DEFAULT_EXTENSIONS})",
     )
     parser.add_argument(
         "--save-folder",
@@ -96,25 +90,6 @@ def normalize_code(raw_code: Optional[str]) -> str:
     return code
 
 
-def normalize_extensions(raw_extensions: Optional[str]) -> Set[str]:
-    source = raw_extensions or DEFAULT_EXTENSIONS
-    extensions = set()
-
-    for ext in source.split(","):
-        cleaned = ext.strip().lower().lstrip(".")
-        if cleaned:
-            extensions.add(f".{cleaned}")
-
-    if not extensions:
-        raise ValueError("At least one valid extension must be provided.")
-
-    return extensions
-
-
-def format_extensions(extensions: Iterable[str]) -> str:
-    return ",".join(sorted(ext.lstrip(".") for ext in extensions))
-
-
 def resolve_folder(folder_arg: Optional[str], config: Dict[str, str]) -> Path:
     if folder_arg:
         return Path(folder_arg).expanduser()
@@ -135,14 +110,12 @@ def ensure_valid_folder(folder: Path):
         raise NotADirectoryError(f"Not a folder: {folder}")
 
 
-def collect_files(folder: Path, allowed_extensions: Set[str]) -> List[Path]:
+def collect_all_files(folder: Path) -> List[Path]:
     return sorted(
         [
             item
             for item in folder.rglob("*")
-            if item.is_file()
-            and item.suffix.lower() in allowed_extensions
-            and not item.name.startswith(".rename_tmp_")
+            if item.is_file() and not item.name.startswith(".rename_tmp_")
         ],
         key=lambda item: (str(item.parent).lower(), item.name.lower()),
     )
@@ -155,12 +128,11 @@ def is_numbered_name(file_path: Path) -> bool:
 def next_sequence_number(
     folder: Path,
     code: str,
-    allowed_extensions: Set[str],
     minimum: int = 1,
 ) -> int:
     highest = minimum - 1
 
-    for file_path in collect_files(folder, allowed_extensions):
+    for file_path in collect_all_files(folder):
         match = NUMBERED_NAME_PATTERN.fullmatch(file_path.stem)
         if match and match.group("code") == code:
             highest = max(highest, int(match.group("number")))
@@ -220,16 +192,16 @@ def apply_plan(plan: RenamePlan, dry_run: bool) -> List[str]:
     return logs
 
 
-def collect_pending_files(folder: Path, allowed_extensions: Set[str]) -> List[Path]:
-    return [file_path for file_path in collect_files(folder, allowed_extensions) if not is_numbered_name(file_path)]
+def collect_pending_files(folder: Path) -> List[Path]:
+    return [file_path for file_path in collect_all_files(folder) if not is_numbered_name(file_path)]
 
 
-def build_existing_files_preview(folder: Path, allowed_extensions: Set[str]) -> List[str]:
+def build_existing_files_preview(folder: Path) -> List[str]:
     preview_lines = []
 
-    for file_path in collect_files(folder, allowed_extensions):
+    for file_path in collect_all_files(folder):
         relative_path = str(file_path.relative_to(folder))
-        status = "[Named]" if is_numbered_name(file_path) else "[Detected]"
+        status = "[Named]" if is_numbered_name(file_path) else "[Present]"
         preview_lines.append(f"{status} {relative_path}")
 
     return preview_lines
@@ -238,18 +210,17 @@ def build_existing_files_preview(folder: Path, allowed_extensions: Set[str]) -> 
 def rename_files(
     folder: Path,
     code: str,
-    allowed_extensions: Set[str],
     start: Optional[int] = None,
     dry_run: bool = False,
     files: Optional[Sequence[Path]] = None,
 ) -> List[str]:
     ensure_valid_folder(folder)
-    source_files = list(files) if files is not None else collect_pending_files(folder, allowed_extensions)
+    source_files = list(files) if files is not None else collect_pending_files(folder)
 
     if not source_files:
         return ["No matching files found."]
 
-    starting_number = start if start is not None else next_sequence_number(folder, code, allowed_extensions)
+    starting_number = start if start is not None else next_sequence_number(folder, code)
     plan = build_rename_plan(source_files, code, starting_number)
     validate_plan(plan)
     return apply_plan(plan, dry_run)
@@ -266,12 +237,10 @@ class BatchRenamerApp:
         self.monitor_after_id = None
         self.file_sizes: Dict[str, int] = {}
         self.preview_files: Dict[str, str] = {}
+        self.activity_logs: List[str] = []
 
         self.folder_var = tk.StringVar(value=self.config.get("default_folder", ""))
         self.code_var = tk.StringVar(value=self.config.get("code", DEFAULT_CODE))
-        self.extensions_var = tk.StringVar(
-            value=self.config.get("extensions", DEFAULT_EXTENSIONS)
-        )
         self.status_var = tk.StringVar(value="Select a folder to start monitoring.")
 
         self.build_ui()
@@ -305,12 +274,6 @@ class BatchRenamerApp:
         code_entry = tk.Entry(self.root, textvariable=self.code_var)
         code_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=8)
 
-        ext_label = tk.Label(self.root, text="Extensions")
-        ext_label.grid(row=3, column=0, sticky="w", padx=16, pady=8)
-
-        ext_entry = tk.Entry(self.root, textvariable=self.extensions_var)
-        ext_entry.grid(row=3, column=1, sticky="ew", padx=8, pady=8)
-
         save_button = tk.Button(self.root, text="Save settings", command=self.save_settings)
         save_button.grid(row=2, column=2, sticky="ew", padx=(8, 16), pady=8)
 
@@ -320,7 +283,7 @@ class BatchRenamerApp:
         controls = tk.Frame(self.root)
         controls.grid(row=4, column=0, columnspan=3, sticky="nsew", padx=16, pady=(8, 16))
         controls.columnconfigure(0, weight=1)
-        controls.rowconfigure(2, weight=1)
+        controls.rowconfigure(1, weight=1)
 
         self.toggle_button = tk.Button(
             controls,
@@ -337,52 +300,57 @@ class BatchRenamerApp:
         )
         status_label.grid(row=0, column=0, sticky="ew", padx=(140, 0), pady=(0, 8))
 
-        preview_label = tk.Label(controls, text="Preview of detected files")
-        preview_label.grid(row=1, column=0, sticky="w")
-
-        self.preview_text = scrolledtext.ScrolledText(controls, height=8, state="disabled", wrap="word")
-        self.preview_text.grid(row=2, column=0, sticky="nsew", pady=(4, 8))
-
         self.log_text = scrolledtext.ScrolledText(controls, state="disabled", wrap="word")
-        self.log_text.grid(row=3, column=0, sticky="nsew")
-        controls.rowconfigure(3, weight=1)
+        self.log_text.grid(row=1, column=0, sticky="nsew")
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def log(self, message: str):
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", f"{message}\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+        self.activity_logs.append(message)
+        self.activity_logs = self.activity_logs[-12:]
+        self.render_monitoring_output()
 
     def set_preview(self, lines: Sequence[str]):
-        self.preview_text.configure(state="normal")
-        self.preview_text.delete("1.0", "end")
+        self.preview_files = {str(index): line for index, line in enumerate(lines)}
+        self.render_monitoring_output()
 
-        if lines:
-            self.preview_text.insert("end", "\n".join(lines))
+    def render_monitoring_output(self):
+        sections = ["FILES PRESENTS"]
+
+        if self.preview_files:
+            sections.extend(self.preview_files[key] for key in sorted(self.preview_files))
         else:
-            self.preview_text.insert("end", "No new files detected.")
+            sections.append("Aucun fichier detecte.")
 
-        self.preview_text.configure(state="disabled")
+        sections.append("")
+        sections.append("ACTIVITE RECENTE")
 
-    def current_settings(self) -> Tuple[Path, str, Set[str]]:
+        if self.activity_logs:
+            sections.extend(self.activity_logs)
+        else:
+            sections.append("Aucun evenement pour le moment.")
+
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.insert("end", "\n".join(sections))
+        self.log_text.see("1.0")
+        self.log_text.configure(state="disabled")
+
+    def current_settings(self) -> Tuple[Path, str]:
         folder = Path(self.folder_var.get()).expanduser()
         code = normalize_code(self.code_var.get())
-        extensions = normalize_extensions(self.extensions_var.get())
         ensure_valid_folder(folder)
-        return folder, code, extensions
+        return folder, code
 
     def save_settings(self):
         try:
-            folder, code, extensions = self.current_settings()
+            folder, code = self.current_settings()
         except Exception as exc:
             messagebox.showerror("Invalid settings", str(exc))
             return
 
         self.config["default_folder"] = str(folder)
         self.config["code"] = code
-        self.config["extensions"] = format_extensions(extensions)
         save_config(self.config)
         self.status_var.set(f"Settings saved for {folder}")
         self.log(f"Saved folder: {folder}")
@@ -403,8 +371,8 @@ class BatchRenamerApp:
 
     def rename_now(self):
         try:
-            folder, code, extensions = self.current_settings()
-            logs = rename_files(folder, code, extensions)
+            folder, code = self.current_settings()
+            logs = rename_files(folder, code)
         except Exception as exc:
             messagebox.showerror("Rename error", str(exc))
             self.status_var.set(str(exc))
@@ -422,7 +390,7 @@ class BatchRenamerApp:
 
     def start_monitoring(self):
         try:
-            folder, _, extensions = self.current_settings()
+            folder, _ = self.current_settings()
         except Exception as exc:
             self.status_var.set(str(exc))
             return
@@ -431,8 +399,8 @@ class BatchRenamerApp:
         self.toggle_button.configure(text="Stop monitoring")
         self.status_var.set(f"Monitoring {folder}")
         self.log(f"Monitoring started: {folder}")
-        self.set_preview(build_existing_files_preview(folder, extensions))
-        self.schedule_monitor()
+        self.set_preview(build_existing_files_preview(folder))
+        self.monitor_folder()
 
     def stop_monitoring(self):
         self.monitoring = False
@@ -444,7 +412,7 @@ class BatchRenamerApp:
         self.toggle_button.configure(text="Start monitoring")
         self.status_var.set("Monitoring stopped.")
         self.log("Monitoring stopped.")
-        self.set_preview([])
+        self.render_monitoring_output()
 
     def schedule_monitor(self):
         if self.monitoring:
@@ -452,9 +420,9 @@ class BatchRenamerApp:
 
     def monitor_folder(self):
         try:
-            folder, code, extensions = self.current_settings()
-            all_files = collect_files(folder, extensions)
-            pending_files = collect_pending_files(folder, extensions)
+            folder, code = self.current_settings()
+            all_files = collect_all_files(folder)
+            pending_files = collect_pending_files(folder)
 
             stable_files = []
             seen_keys = set()
@@ -465,6 +433,8 @@ class BatchRenamerApp:
                 relative_path = str(file_path.relative_to(folder))
                 if is_numbered_name(file_path):
                     preview_map[key] = f"[Named] {relative_path}"
+                else:
+                    preview_map[key] = f"[Detected] {relative_path}"
 
             for file_path in pending_files:
                 key = str(file_path)
@@ -485,10 +455,10 @@ class BatchRenamerApp:
                 key: size for key, size in self.file_sizes.items() if key in seen_keys
             }
             self.preview_files = preview_map
-            self.set_preview([self.preview_files[key] for key in sorted(self.preview_files)])
+            self.render_monitoring_output()
 
             if stable_files:
-                logs = rename_files(folder, code, extensions, files=stable_files)
+                logs = rename_files(folder, code, files=stable_files)
                 for line in logs:
                     self.log(line)
                 self.status_var.set(f"Detected and renamed {len(stable_files)} new file(s).")
@@ -497,7 +467,7 @@ class BatchRenamerApp:
                     self.file_sizes.pop(str(file_path), None)
                     self.preview_files.pop(str(file_path), None)
 
-                self.set_preview([self.preview_files[key] for key in sorted(self.preview_files)])
+                self.render_monitoring_output()
             else:
                 self.status_var.set(f"Monitoring {folder}")
 
@@ -526,7 +496,6 @@ def launch_gui():
 def run_cli(args):
     config = load_config()
     code = normalize_code(args.code or config.get("code"))
-    extensions = normalize_extensions(args.extensions or config.get("extensions"))
     folder = resolve_folder(args.folder, config)
 
     ensure_valid_folder(folder)
@@ -537,11 +506,10 @@ def run_cli(args):
     if args.save_folder:
         config["default_folder"] = str(folder)
         config["code"] = code
-        config["extensions"] = format_extensions(extensions)
         save_config(config)
         print(f"Default folder saved: {folder}")
 
-    logs = rename_files(folder, code, extensions, start=args.start, dry_run=args.dry_run)
+    logs = rename_files(folder, code, start=args.start, dry_run=args.dry_run)
     for line in logs:
         print(line)
 
