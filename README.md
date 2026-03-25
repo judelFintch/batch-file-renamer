@@ -1,33 +1,27 @@
 # batch-file-renamer
 
-Python tool to rename scanned files with an acronym and an automatic sequence.
+Python tool to monitor a scanner folder and rename files with an acronym plus an automatic sequence.
 
 ## What It Does
 
-The project now includes:
+The project includes:
 
-- a graphical interface to choose the scanner folder
-- saved settings so the selected folder is remembered
-- automatic monitoring of the folder
-- automatic renaming of new scanned files
-- CLI support if you still want to run it from the terminal
+- a GUI to choose the scanner folder
+- saved settings for the folder and acronym
+- recursive monitoring of the selected folder and its subfolders
+- automatic detection of files created by the scanner
+- automatic renaming with a sequence such as `FAC_001`
+- CLI support for batch renaming from the terminal
 
 Example output names:
 
 ```text
 FAC_001.pdf
-FAC_002.png
-CLI_003.pdf
+FAC_002.jpg
+FAC_003
 ```
 
-## Supported Files
-
-By default, the app watches and renames:
-
-- `.pdf`
-- `.png`
-
-You can change the extensions list from the GUI or the CLI.
+The original suffix is preserved when the file has one.
 
 ## Graphical Interface
 
@@ -47,38 +41,36 @@ The interface lets you:
 
 - browse and select the folder used by the scanner
 - enter an acronym such as `FAC`, `CLI`, `ORD`, `BL`
-- define the allowed extensions
 - save the settings
 - rename current files immediately
 - start or stop automatic monitoring
 
-## Saved Folder and Settings
+## Monitoring View
 
-When you select a folder and save the settings, the app stores:
+The monitoring panel shows two sections:
 
-- the default folder
-- the acronym
-- the extensions list
+- `FILES PRESENTS`: files currently found in the selected folder and all subfolders
+- `ACTIVITE RECENTE`: recent monitoring and renaming events
 
-These settings are saved in:
+Displayed states:
 
-```text
-.batch_renamer.json
-```
-
-The next time you open the app, it reloads the saved folder and starts monitoring it automatically if the folder still exists.
+- `[Present]`: file found and not yet renamed for the active code
+- `[Detected]`: file currently tracked by monitoring
+- `[Writing]`: file is still changing size, so the app waits
+- `[Ready]`: file is stable and ready to be renamed
+- `[Named]`: file already renamed with the active code
 
 ## Automatic Detection
 
 The GUI checks the selected folder every few seconds.
 
-When a new scan appears:
+When a file appears:
 
-1. the app waits until the file size stops changing
-2. it considers the file stable
-3. it renames it automatically
+1. the app detects it recursively, including inside subfolders
+2. it waits until the file size stops changing
+3. it renames the file automatically
 
-This avoids renaming a file while the scanner is still writing it.
+This prevents renaming a file while the scanner is still writing it.
 
 ## Naming Format
 
@@ -94,23 +86,39 @@ Examples:
 
 - `FAC_001.pdf`
 - `FAC_002.png`
-- `CLI_003.pdf`
+- `CLI_003.docx`
 
-The original extension is preserved.
+The current code is important:
+
+- files already named with the active code are treated as done
+- files named with another code can still be renamed with the current code
 
 ## Basic GUI Workflow
 
 1. Run `python3 index.py`
 2. Click `Browse`
-3. Select the folder where your scanner saves files
+3. Select the parent folder used by the scanner
 4. Enter your acronym, for example `FAC`
 5. Click `Save settings`
-6. Click `Rename now` for existing files if needed
+6. Click `Rename now` to rename existing files already present
 7. Leave monitoring enabled for future scans
 
-## CLI Usage
+## Saved Settings
 
-You can still use the terminal mode.
+When you save the settings, the app stores:
+
+- the default folder
+- the acronym
+
+These settings are saved in:
+
+```text
+.batch_renamer.json
+```
+
+The next time you open the app, it reloads the saved folder and starts monitoring it automatically if the folder still exists.
+
+## CLI Usage
 
 Basic command:
 
@@ -130,12 +138,6 @@ Preview only:
 python3 index.py ~/Desktop/scans --code FAC --dry-run
 ```
 
-Rename only PNG files:
-
-```bash
-python3 index.py ~/Desktop/scans --code IMG --extensions png
-```
-
 Save a default folder from the CLI:
 
 ```bash
@@ -145,7 +147,7 @@ python3 index.py ~/Desktop/scans --code FAC --save-folder --dry-run
 ## CLI Options
 
 ```bash
-python3 index.py [folder] [--code CODE] [--start NUMBER] [--extensions LIST] [--save-folder] [--dry-run] [--gui]
+python3 index.py [folder] [--code CODE] [--start NUMBER] [--save-folder] [--dry-run] [--gui]
 ```
 
 Options:
@@ -153,7 +155,6 @@ Options:
 - `folder`: folder containing the files to rename
 - `--code`: acronym for the new filenames
 - `--start`: first number in the sequence for CLI batch renaming
-- `--extensions`: comma-separated extensions such as `pdf,png,jpg`
 - `--save-folder`: save the folder and current settings
 - `--dry-run`: preview mode, no file is changed
 - `--gui`: launch the graphical interface
@@ -161,17 +162,17 @@ Options:
 ## How Renaming Works
 
 1. The app loads the saved settings or the values you enter.
-2. It filters files by extension.
-3. It ignores files already named like `CODE_001`.
-4. It finds the next available number for the selected acronym.
-5. It renames new files safely through temporary names.
+2. It scans all files recursively in the selected folder.
+3. It ignores only files already named with the active code.
+4. It finds the next available number for that code.
+5. It renames files safely through temporary names.
 
 ## Safety Notes
 
 - Existing target files block the operation before changes are applied
-- Files already using the numbered acronym format are ignored by the watcher
-- Unsupported extensions are ignored
-- The original extension is preserved
+- Files are renamed only after they become stable
+- The original suffix is preserved
+- Hidden temporary rename files are ignored by the scanner
 
 ## Requirements
 
