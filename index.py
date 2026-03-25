@@ -121,8 +121,13 @@ def collect_all_files(folder: Path) -> List[Path]:
     )
 
 
-def is_numbered_name(file_path: Path) -> bool:
-    return NUMBERED_NAME_PATTERN.fullmatch(file_path.stem) is not None
+def get_numbered_name_match(file_path: Path):
+    return NUMBERED_NAME_PATTERN.fullmatch(file_path.stem)
+
+
+def is_named_for_code(file_path: Path, code: str) -> bool:
+    match = get_numbered_name_match(file_path)
+    return match is not None and match.group("code") == code
 
 
 def next_sequence_number(
@@ -133,7 +138,7 @@ def next_sequence_number(
     highest = minimum - 1
 
     for file_path in collect_all_files(folder):
-        match = NUMBERED_NAME_PATTERN.fullmatch(file_path.stem)
+        match = get_numbered_name_match(file_path)
         if match and match.group("code") == code:
             highest = max(highest, int(match.group("number")))
 
@@ -192,16 +197,16 @@ def apply_plan(plan: RenamePlan, dry_run: bool) -> List[str]:
     return logs
 
 
-def collect_pending_files(folder: Path) -> List[Path]:
-    return [file_path for file_path in collect_all_files(folder) if not is_numbered_name(file_path)]
+def collect_pending_files(folder: Path, code: str) -> List[Path]:
+    return [file_path for file_path in collect_all_files(folder) if not is_named_for_code(file_path, code)]
 
 
-def build_existing_files_preview(folder: Path) -> List[str]:
+def build_existing_files_preview(folder: Path, code: str) -> List[str]:
     preview_lines = []
 
     for file_path in collect_all_files(folder):
         relative_path = str(file_path.relative_to(folder))
-        status = "[Named]" if is_numbered_name(file_path) else "[Present]"
+        status = "[Named]" if is_named_for_code(file_path, code) else "[Present]"
         preview_lines.append(f"{status} {relative_path}")
 
     return preview_lines
@@ -215,7 +220,7 @@ def rename_files(
     files: Optional[Sequence[Path]] = None,
 ) -> List[str]:
     ensure_valid_folder(folder)
-    source_files = list(files) if files is not None else collect_pending_files(folder)
+    source_files = list(files) if files is not None else collect_pending_files(folder, code)
 
     if not source_files:
         return ["No matching files found."]
@@ -390,7 +395,7 @@ class BatchRenamerApp:
 
     def start_monitoring(self):
         try:
-            folder, _ = self.current_settings()
+            folder, code = self.current_settings()
         except Exception as exc:
             self.status_var.set(str(exc))
             return
@@ -399,7 +404,7 @@ class BatchRenamerApp:
         self.toggle_button.configure(text="Stop monitoring")
         self.status_var.set(f"Monitoring {folder}")
         self.log(f"Monitoring started: {folder}")
-        self.set_preview(build_existing_files_preview(folder))
+        self.set_preview(build_existing_files_preview(folder, code))
         self.monitor_folder()
 
     def stop_monitoring(self):
@@ -422,7 +427,7 @@ class BatchRenamerApp:
         try:
             folder, code = self.current_settings()
             all_files = collect_all_files(folder)
-            pending_files = collect_pending_files(folder)
+            pending_files = collect_pending_files(folder, code)
 
             stable_files = []
             seen_keys = set()
@@ -431,7 +436,7 @@ class BatchRenamerApp:
             for file_path in all_files:
                 key = str(file_path)
                 relative_path = str(file_path.relative_to(folder))
-                if is_numbered_name(file_path):
+                if is_named_for_code(file_path, code):
                     preview_map[key] = f"[Named] {relative_path}"
                 else:
                     preview_map[key] = f"[Detected] {relative_path}"
