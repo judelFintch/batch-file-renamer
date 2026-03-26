@@ -328,10 +328,11 @@ class BatchRenamerApp:
         self.pending_paths: List[Path] = []
 
         self.folder_var = tk.StringVar(value=self.config.get("default_folder", ""))
-        self.code_var = tk.StringVar(value=self.config.get("code", DEFAULT_CODE))
         self.manual_folder_var = tk.StringVar()
         self.manual_folder_name_var = tk.StringVar()
         self.document_type_var = tk.StringVar(value=next(iter(self.document_types)))
+        self.type_label_var = tk.StringVar()
+        self.type_code_var = tk.StringVar()
         self.assignment_info_var = tk.StringVar(value="Select a file to classify.")
         self.status_var = tk.StringVar(value="Select a folder to start monitoring.")
 
@@ -360,43 +361,62 @@ class BatchRenamerApp:
         browse_button = tk.Button(self.root, text="Browse", command=self.select_folder)
         browse_button.grid(row=1, column=2, sticky="ew", padx=(8, 16), pady=8)
 
-        code_label = tk.Label(self.root, text="Acronym")
-        code_label.grid(row=2, column=0, sticky="w", padx=16, pady=8)
-
-        code_entry = tk.Entry(self.root, textvariable=self.code_var)
-        code_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=8)
-
         save_button = tk.Button(self.root, text="Save settings", command=self.save_settings)
         save_button.grid(row=2, column=2, sticky="ew", padx=(8, 16), pady=8)
 
-        rename_button = tk.Button(self.root, text="Rename now", command=self.rename_now)
-        rename_button.grid(row=3, column=2, sticky="ew", padx=(8, 16), pady=8)
-
         manual_folder_label = tk.Label(self.root, text="Folder to rename")
-        manual_folder_label.grid(row=4, column=0, sticky="w", padx=16, pady=8)
+        manual_folder_label.grid(row=3, column=0, sticky="w", padx=16, pady=8)
 
         manual_folder_entry = tk.Entry(self.root, textvariable=self.manual_folder_var)
-        manual_folder_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=8)
+        manual_folder_entry.grid(row=3, column=1, sticky="ew", padx=8, pady=8)
 
         manual_folder_button = tk.Button(
             self.root,
             text="Choose folder",
             command=self.select_manual_folder,
         )
-        manual_folder_button.grid(row=4, column=2, sticky="ew", padx=(8, 16), pady=8)
+        manual_folder_button.grid(row=3, column=2, sticky="ew", padx=(8, 16), pady=8)
 
         manual_name_label = tk.Label(self.root, text="New folder name")
-        manual_name_label.grid(row=5, column=0, sticky="w", padx=16, pady=8)
+        manual_name_label.grid(row=4, column=0, sticky="w", padx=16, pady=8)
 
         manual_name_entry = tk.Entry(self.root, textvariable=self.manual_folder_name_var)
-        manual_name_entry.grid(row=5, column=1, sticky="ew", padx=8, pady=8)
+        manual_name_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=8)
 
         manual_rename_button = tk.Button(
             self.root,
             text="Rename folder",
             command=self.rename_selected_folder,
         )
-        manual_rename_button.grid(row=5, column=2, sticky="ew", padx=(8, 16), pady=8)
+        manual_rename_button.grid(row=4, column=2, sticky="ew", padx=(8, 16), pady=8)
+
+        types_frame = tk.LabelFrame(self.root, text="Document types")
+        types_frame.grid(row=5, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 8))
+        types_frame.columnconfigure(0, weight=1)
+        types_frame.columnconfigure(1, weight=1)
+        types_frame.columnconfigure(2, weight=1)
+
+        self.types_listbox = tk.Listbox(types_frame, exportselection=False, height=5)
+        self.types_listbox.grid(row=0, column=0, rowspan=4, sticky="nsew", padx=(12, 8), pady=12)
+        self.types_listbox.bind("<<ListboxSelect>>", self.on_type_selection)
+
+        type_label_label = tk.Label(types_frame, text="Label")
+        type_label_label.grid(row=0, column=1, sticky="w", padx=(8, 12), pady=(12, 4))
+
+        type_label_entry = tk.Entry(types_frame, textvariable=self.type_label_var)
+        type_label_entry.grid(row=1, column=1, sticky="ew", padx=(8, 12))
+
+        type_code_label = tk.Label(types_frame, text="Code")
+        type_code_label.grid(row=0, column=2, sticky="w", padx=(0, 12), pady=(12, 4))
+
+        type_code_entry = tk.Entry(types_frame, textvariable=self.type_code_var)
+        type_code_entry.grid(row=1, column=2, sticky="ew", padx=(0, 12))
+
+        add_type_button = tk.Button(types_frame, text="Add / update", command=self.add_or_update_document_type)
+        add_type_button.grid(row=2, column=1, sticky="ew", padx=(8, 12), pady=(8, 12))
+
+        delete_type_button = tk.Button(types_frame, text="Delete", command=self.delete_document_type)
+        delete_type_button.grid(row=2, column=2, sticky="ew", padx=(0, 12), pady=(8, 12))
 
         classification_frame = tk.LabelFrame(self.root, text="Document classification")
         classification_frame.grid(row=6, column=0, columnspan=3, sticky="nsew", padx=16, pady=(0, 8))
@@ -482,6 +502,7 @@ class BatchRenamerApp:
         self.log_text.grid(row=1, column=0, sticky="nsew")
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.refresh_document_type_widgets()
 
     def log(self, message: str):
         self.activity_logs.append(message)
@@ -514,29 +535,22 @@ class BatchRenamerApp:
         self.log_text.see("1.0")
         self.log_text.configure(state="disabled")
 
-    def current_settings(self) -> Tuple[Path, str]:
+    def current_settings(self) -> Path:
         folder = Path(self.folder_var.get()).expanduser()
-        code = normalize_code(self.code_var.get())
         ensure_valid_folder(folder)
-        return folder, code
+        return folder
 
     def known_codes(self) -> List[str]:
-        codes = list(self.document_types.values())
-        try:
-            codes.append(normalize_code(self.code_var.get()))
-        except ValueError:
-            pass
-        return sorted(set(codes))
+        return sorted(set(self.document_types.values()))
 
     def save_settings(self):
         try:
-            folder, code = self.current_settings()
+            folder = self.current_settings()
         except Exception as exc:
             messagebox.showerror("Invalid settings", str(exc))
             return
 
         self.config["default_folder"] = str(folder)
-        self.config["code"] = code
         self.config["document_types"] = self.document_types
         save_config(self.config)
         self.status_var.set(f"Settings saved for {folder}")
@@ -601,18 +615,90 @@ class BatchRenamerApp:
             self.stop_monitoring()
             self.start_monitoring()
 
-    def rename_now(self):
-        try:
-            folder, code = self.current_settings()
-            logs = rename_files(folder, code)
-        except Exception as exc:
-            messagebox.showerror("Rename error", str(exc))
-            self.status_var.set(str(exc))
+    def refresh_document_type_widgets(self):
+        labels = list(self.document_types.keys())
+        self.types_listbox.delete(0, "end")
+        for label in labels:
+            self.types_listbox.insert("end", f"{label} -> {self.document_types[label]}")
+
+        self.document_type_combo["values"] = labels
+        if labels:
+            current_type = self.document_type_var.get()
+            if current_type not in self.document_types:
+                self.document_type_var.set(labels[0])
+            if not self.type_label_var.get().strip():
+                self.type_label_var.set(self.document_type_var.get())
+                self.type_code_var.set(self.document_types[self.document_type_var.get()])
+
+    def on_type_selection(self, _event=None):
+        selection = self.types_listbox.curselection()
+        if not selection:
             return
 
-        for line in logs:
-            self.log(line)
-        self.status_var.set("Manual rename completed.")
+        label = list(self.document_types.keys())[selection[0]]
+        self.type_label_var.set(label)
+        self.type_code_var.set(self.document_types[label])
+        self.document_type_var.set(label)
+
+    def add_or_update_document_type(self):
+        label = self.type_label_var.get().strip()
+        raw_code = self.type_code_var.get().strip()
+
+        if not label:
+            messagebox.showerror("Document type error", "The label cannot be empty.")
+            return
+
+        try:
+            code = normalize_code(raw_code)
+        except Exception as exc:
+            messagebox.showerror("Document type error", str(exc))
+            return
+
+        self.document_types[label] = code
+        self.refresh_document_type_widgets()
+        self.config["document_types"] = self.document_types
+        save_config(self.config)
+        try:
+            folder = self.current_settings()
+        except Exception:
+            pass
+        else:
+            self.refresh_pending_list(folder)
+            self.set_preview(build_existing_files_preview(folder, self.known_codes()))
+        self.status_var.set(f"Saved document type: {label} -> {code}")
+
+    def delete_document_type(self):
+        selection = self.types_listbox.curselection()
+        if not selection:
+            messagebox.showerror("Document type error", "Select a document type to delete.")
+            return
+        if len(self.document_types) == 1:
+            messagebox.showerror("Document type error", "Keep at least one document type.")
+            return
+
+        label = list(self.document_types.keys())[selection[0]]
+        self.document_types.pop(label, None)
+
+        keys_to_remove = [
+            key for key, assigned_label in self.pending_assignments.items() if assigned_label == label
+        ]
+        for key in keys_to_remove:
+            self.pending_assignments.pop(key, None)
+
+        self.type_label_var.set("")
+        self.type_code_var.set("")
+        self.refresh_document_type_widgets()
+        self.config["document_types"] = self.document_types
+        save_config(self.config)
+        self.assignment_info_var.set("Select a file to classify.")
+        try:
+            folder = self.current_settings()
+        except Exception:
+            pass
+        else:
+            self.refresh_pending_list(folder)
+            self.set_preview(build_existing_files_preview(folder, self.known_codes()))
+        self.status_var.set(f"Deleted document type: {label}")
 
     def refresh_pending_list(self, folder: Path):
         current_selection = self.selected_pending_file()
@@ -698,7 +784,7 @@ class BatchRenamerApp:
         self.pending_statuses[str(selected_file)] = "Assigned"
 
         try:
-            folder, _ = self.current_settings()
+            folder = self.current_settings()
         except Exception:
             return
 
@@ -707,7 +793,7 @@ class BatchRenamerApp:
 
     def rename_classified_files(self):
         try:
-            folder, _ = self.current_settings()
+            folder = self.current_settings()
         except Exception as exc:
             messagebox.showerror("Rename error", str(exc))
             self.status_var.set(str(exc))
@@ -755,7 +841,7 @@ class BatchRenamerApp:
 
     def start_monitoring(self):
         try:
-            folder, _ = self.current_settings()
+            folder = self.current_settings()
         except Exception as exc:
             self.status_var.set(str(exc))
             return
@@ -789,7 +875,7 @@ class BatchRenamerApp:
 
     def monitor_folder(self):
         try:
-            folder, _ = self.current_settings()
+            folder = self.current_settings()
             all_files = collect_all_files(folder)
             pending_files = collect_pending_files_for_codes(folder, self.known_codes())
             preview_map: Dict[str, str] = {}
