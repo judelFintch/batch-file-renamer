@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -34,6 +35,8 @@ DEFAULT_DOCUMENT_TYPES = {
     "Certificat d'assurance": "CAA",
 }
 DEFAULT_AUTO_RENAME = True
+AUTO_DETECT_MIN_SCORE = 2
+AUTO_DETECT_MIN_MARGIN = 1
 
 
 RenamePlan = List[Tuple[Path, Path]]
@@ -135,6 +138,15 @@ def normalize_document_keywords(
         normalized[label] = [str(keyword).strip().lower() for keyword in items if str(keyword).strip()]
 
     return normalized
+
+
+def normalize_text_for_matching(text: str) -> str:
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", ascii_text.lower()).strip()
+
+
+def split_keyword_tokens(keyword: str) -> List[str]:
+    return [token for token in re.split(r"[^a-z0-9]+", normalize_text_for_matching(keyword)) if token]
 
 
 def resolve_folder(folder_arg: Optional[str], config: Dict[str, str]) -> Path:
@@ -377,7 +389,7 @@ def detect_document_type(
     document_keywords: Dict[str, Sequence[str]],
 ) -> Tuple[Optional[str], int, List[str], str]:
     raw_text, extraction_method = extract_text_for_detection(file_path)
-    text = raw_text.lower()
+    text = normalize_text_for_matching(raw_text)
     if not text.strip():
         if file_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"} and not ocr_is_available():
             return None, 0, [], "ocr_missing"
@@ -388,14 +400,40 @@ def detect_document_type(
     best_label = None
     best_score = 0
     best_matches: List[str] = []
+    second_best_score = 0
 
     for label in document_types:
-        matches = [keyword for keyword in document_keywords.get(label, []) if keyword and keyword in text]
-        score = len(matches)
+        matches: List[str] = []
+        score = 0
+
+        for keyword in document_keywords.get(label, []):
+            normalized_keyword = normalize_text_for_matching(keyword)
+            if not normalized_keyword:
+                continue
+
+            if normalized_keyword in text:
+                matches.append(keyword)
+                score += 3 if " " in normalized_keyword else 2
+                continue
+
+            keyword_tokens = split_keyword_tokens(normalized_keyword)
+            if keyword_tokens and all(token in text for token in keyword_tokens):
+                matches.append(keyword)
+                score += 1
+
         if score > best_score:
+            second_best_score = best_score
             best_label = label
             best_score = score
             best_matches = matches
+        elif score > second_best_score:
+            second_best_score = score
+
+    if best_score < AUTO_DETECT_MIN_SCORE:
+        return None, best_score, best_matches, "low_confidence"
+
+    if best_score - second_best_score < AUTO_DETECT_MIN_MARGIN:
+        return None, best_score, best_matches, "ambiguous_match"
 
     if best_score == 0:
         return None, 0, [], "no_keyword_match"
@@ -973,6 +1011,12 @@ class BatchRenamerApp:
                 elif detection_status.startswith("no_text_extracted"):
                     self.pending_statuses[key] = "No text"
                     self.log(f"No readable text found in {file_path.name}. OCR could not be applied.")
+                elif detection_status == "ambiguous_match":
+                    self.pending_statuses[key] = "Ambiguous"
+                    self.log(f"Ambiguous detection for {file_path.name}. Multiple document types scored similarly.")
+                elif detection_status == "low_confidence":
+                    self.pending_statuses[key] = "Low confidence"
+                    self.log(f"Low-confidence detection for {file_path.name}. Add stronger keywords or review manually.")
                 else:
                     self.pending_statuses[key] = "Review"
                     self.log(f"No keyword match found for {file_path.name}. Check the configured keywords.")
