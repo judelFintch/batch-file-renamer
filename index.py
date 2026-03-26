@@ -327,6 +327,34 @@ def extract_response_text(response_payload: Dict[str, Any]) -> str:
     return ""
 
 
+def send_openai_responses_request(
+    api_key: str,
+    endpoint_url: str,
+    request_body: Dict[str, Any],
+    timeout: int = 45,
+) -> Dict[str, Any]:
+    request = urllib.request.Request(
+        endpoint_url,
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw_response = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"AI agent request failed: {exc.code} {error_body}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"AI agent request failed: {exc.reason}") from exc
+
+    return json.loads(raw_response)
+
+
 def ask_ai_agent_to_classify(
     file_path: Path,
     extracted_text: str,
@@ -402,26 +430,7 @@ def ask_ai_agent_to_classify(
         },
     }
 
-    request = urllib.request.Request(
-        endpoint_url,
-        data=json.dumps(request_body).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            raw_response = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"AI agent request failed: {exc.code} {error_body}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"AI agent request failed: {exc.reason}") from exc
-
-    response_payload = json.loads(raw_response)
+    response_payload = send_openai_responses_request(api_key, endpoint_url, request_body)
     response_text = extract_response_text(response_payload).strip()
     if not response_text:
         raise RuntimeError("AI agent returned an empty response.")
@@ -859,6 +868,7 @@ class BatchRenamerApp:
         self.api_key_var = tk.StringVar(value=self.config.get("openai_api_key", os.environ.get("OPENAI_API_KEY", "")))
         self.api_model_var = tk.StringVar(value=self.config.get("openai_model", DEFAULT_OPENAI_MODEL))
         self.api_url_var = tk.StringVar(value=self.config.get("openai_responses_url", DEFAULT_OPENAI_RESPONSES_URL))
+        self.api_test_status_var = tk.StringVar(value="API status: not tested")
         self.assignment_info_var = tk.StringVar(value="Select a file to classify.")
         self.reference_info_var = tk.StringVar(value="No reference selected.")
         self.status_var = tk.StringVar(value="Select a folder to start monitoring.")
@@ -1097,6 +1107,15 @@ class BatchRenamerApp:
         tk.Entry(api_frame, textvariable=self.api_url_var).grid(
             row=2, column=1, sticky="ew", padx=(8, 12), pady=(8, 12)
         )
+        tk.Button(api_frame, text="Test API", command=self.test_api_connection).grid(
+            row=3, column=0, sticky="ew", padx=12, pady=(0, 12)
+        )
+        tk.Label(
+            api_frame,
+            textvariable=self.api_test_status_var,
+            anchor="w",
+            justify="left",
+        ).grid(row=3, column=1, sticky="ew", padx=(8, 12), pady=(0, 12))
 
         manual_frame = tk.LabelFrame(window, text="Folder renaming")
         manual_frame.grid(row=6, column=0, columnspan=3, sticky="ew", padx=16, pady=(8, 8))
@@ -1381,6 +1400,35 @@ class BatchRenamerApp:
             self.api_model_var.get().strip() or DEFAULT_OPENAI_MODEL,
             self.api_url_var.get().strip() or DEFAULT_OPENAI_RESPONSES_URL,
         )
+
+    def test_api_connection(self):
+        api_key, api_model, api_url = self.api_settings()
+        if not api_key:
+            self.api_test_status_var.set("API status: failed")
+            messagebox.showerror("API test", "Failed: API token is empty.")
+            return
+
+        request_body = {
+            "model": api_model,
+            "input": "Return the word successful.",
+            "max_output_tokens": 16,
+        }
+
+        try:
+            response_payload = send_openai_responses_request(api_key, api_url, request_body, timeout=30)
+            response_text = extract_response_text(response_payload).strip()
+        except Exception as exc:
+            self.api_test_status_var.set("API status: failed")
+            messagebox.showerror("API test", f"Failed: {exc}")
+            return
+
+        if response_text:
+            self.api_test_status_var.set("API status: successful")
+            messagebox.showinfo("API test", f"Successful: {response_text}")
+            return
+
+        self.api_test_status_var.set("API status: failed")
+        messagebox.showerror("API test", "Failed: empty response from API.")
 
     def select_folder(self):
         selected = filedialog.askdirectory(
