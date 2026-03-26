@@ -20,7 +20,6 @@ else:
 
 CONFIG_FILE = Path(__file__).with_name(".batch_renamer.json")
 DEFAULT_CODE = "FAC"
-DEFAULT_RENAME_FOLDERS = False
 MONITOR_INTERVAL_MS = 2000
 NUMBERED_NAME_PATTERN = re.compile(r"^(?P<code>[A-Z0-9]+)_(?P<number>\d+)$")
 
@@ -59,11 +58,6 @@ def parse_args():
         "--dry-run",
         action="store_true",
         help="Preview the rename operations without changing files",
-    )
-    parser.add_argument(
-        "--rename-folders",
-        action="store_true",
-        help="Rename subfolders containing files as well",
     )
     parser.add_argument(
         "--gui",
@@ -127,22 +121,6 @@ def collect_all_files(folder: Path) -> List[Path]:
     )
 
 
-def collect_candidate_folders(folder: Path) -> List[Path]:
-    candidates = []
-
-    for item in folder.rglob("*"):
-        if not item.is_dir():
-            continue
-        if item == folder:
-            continue
-        if item.name.startswith(".rename_tmp_"):
-            continue
-        if any(child.is_file() for child in item.rglob("*")):
-            candidates.append(item)
-
-    return sorted(candidates, key=lambda item: (-len(item.relative_to(folder).parts), str(item).lower()))
-
-
 def get_numbered_name_match(file_path: Path):
     return NUMBERED_NAME_PATTERN.fullmatch(file_path.stem)
 
@@ -159,9 +137,7 @@ def next_sequence_number(
 ) -> int:
     highest = minimum - 1
 
-    scan_paths = [*collect_all_files(folder), *collect_candidate_folders(folder)]
-
-    for file_path in scan_paths:
+    for file_path in collect_all_files(folder):
         match = get_numbered_name_match(file_path)
         if match and match.group("code") == code:
             highest = max(highest, int(match.group("number")))
@@ -175,16 +151,6 @@ def build_rename_plan(files: Sequence[Path], code: str, start: int) -> RenamePla
     for offset, file_path in enumerate(files, start=start):
         new_name = f"{code}_{offset:03}{file_path.suffix.lower()}"
         plan.append((file_path, file_path.with_name(new_name)))
-
-    return plan
-
-
-def build_folder_rename_plan(folders: Sequence[Path], code: str, start: int) -> RenamePlan:
-    plan = []
-
-    for offset, folder_path in enumerate(folders, start=start):
-        new_name = f"{code}_{offset:03}"
-        plan.append((folder_path, folder_path.with_name(new_name)))
 
     return plan
 
@@ -236,23 +202,13 @@ def collect_pending_files(folder: Path, code: str) -> List[Path]:
     return [file_path for file_path in collect_all_files(folder) if not is_named_for_code(file_path, code)]
 
 
-def collect_pending_folders(folder: Path, code: str) -> List[Path]:
-    return [folder_path for folder_path in collect_candidate_folders(folder) if not is_named_for_code(folder_path, code)]
-
-
-def build_existing_files_preview(folder: Path, code: str, rename_folders: bool) -> List[str]:
+def build_existing_files_preview(folder: Path, code: str) -> List[str]:
     preview_lines = []
 
     for file_path in collect_all_files(folder):
         relative_path = str(file_path.relative_to(folder))
         status = "[Named]" if is_named_for_code(file_path, code) else "[Present]"
         preview_lines.append(f"{status} FILE {relative_path}")
-
-    if rename_folders:
-        for folder_path in collect_candidate_folders(folder):
-            relative_path = str(folder_path.relative_to(folder))
-            status = "[Named]" if is_named_for_code(folder_path, code) else "[Present]"
-            preview_lines.append(f"{status} DIR  {relative_path}")
 
     return preview_lines
 
@@ -272,25 +228,6 @@ def rename_files(
 
     starting_number = start if start is not None else next_sequence_number(folder, code)
     plan = build_rename_plan(source_files, code, starting_number)
-    validate_plan(plan)
-    return apply_plan(plan, dry_run)
-
-
-def rename_folders(
-    folder: Path,
-    code: str,
-    start: Optional[int] = None,
-    dry_run: bool = False,
-    folders: Optional[Sequence[Path]] = None,
-) -> List[str]:
-    ensure_valid_folder(folder)
-    source_folders = list(folders) if folders is not None else collect_pending_folders(folder, code)
-
-    if not source_folders:
-        return ["No matching folders found."]
-
-    starting_number = start if start is not None else next_sequence_number(folder, code)
-    plan = build_folder_rename_plan(source_folders, code, starting_number)
     validate_plan(plan)
     return apply_plan(plan, dry_run)
 
@@ -331,9 +268,6 @@ class BatchRenamerApp:
 
         self.folder_var = tk.StringVar(value=self.config.get("default_folder", ""))
         self.code_var = tk.StringVar(value=self.config.get("code", DEFAULT_CODE))
-        self.rename_folders_var = tk.BooleanVar(
-            value=self.config.get("rename_folders", DEFAULT_RENAME_FOLDERS)
-        )
         self.manual_folder_var = tk.StringVar()
         self.manual_folder_name_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Select a folder to start monitoring.")
@@ -368,13 +302,6 @@ class BatchRenamerApp:
 
         code_entry = tk.Entry(self.root, textvariable=self.code_var)
         code_entry.grid(row=2, column=1, sticky="ew", padx=8, pady=8)
-
-        rename_folders_check = tk.Checkbutton(
-            self.root,
-            text="Rename subfolders too",
-            variable=self.rename_folders_var,
-        )
-        rename_folders_check.grid(row=3, column=1, sticky="w", padx=8, pady=8)
 
         save_button = tk.Button(self.root, text="Save settings", command=self.save_settings)
         save_button.grid(row=2, column=2, sticky="ew", padx=(8, 16), pady=8)
@@ -464,22 +391,21 @@ class BatchRenamerApp:
         self.log_text.see("1.0")
         self.log_text.configure(state="disabled")
 
-    def current_settings(self) -> Tuple[Path, str, bool]:
+    def current_settings(self) -> Tuple[Path, str]:
         folder = Path(self.folder_var.get()).expanduser()
         code = normalize_code(self.code_var.get())
         ensure_valid_folder(folder)
-        return folder, code, self.rename_folders_var.get()
+        return folder, code
 
     def save_settings(self):
         try:
-            folder, code, rename_folders = self.current_settings()
+            folder, code = self.current_settings()
         except Exception as exc:
             messagebox.showerror("Invalid settings", str(exc))
             return
 
         self.config["default_folder"] = str(folder)
         self.config["code"] = code
-        self.config["rename_folders"] = rename_folders
         save_config(self.config)
         self.status_var.set(f"Settings saved for {folder}")
         self.log(f"Saved folder: {folder}")
@@ -545,12 +471,8 @@ class BatchRenamerApp:
 
     def rename_now(self):
         try:
-            folder, code, rename_folders_enabled = self.current_settings()
+            folder, code = self.current_settings()
             logs = rename_files(folder, code)
-            if rename_folders_enabled:
-                folder_logs = rename_folders(folder, code)
-                if folder_logs != ["No matching folders found."]:
-                    logs.extend(folder_logs)
         except Exception as exc:
             messagebox.showerror("Rename error", str(exc))
             self.status_var.set(str(exc))
@@ -568,7 +490,7 @@ class BatchRenamerApp:
 
     def start_monitoring(self):
         try:
-            folder, code, rename_folders_enabled = self.current_settings()
+            folder, code = self.current_settings()
         except Exception as exc:
             self.status_var.set(str(exc))
             return
@@ -577,7 +499,7 @@ class BatchRenamerApp:
         self.toggle_button.configure(text="Stop monitoring")
         self.status_var.set(f"Monitoring {folder}")
         self.log(f"Monitoring started: {folder}")
-        self.set_preview(build_existing_files_preview(folder, code, rename_folders_enabled))
+        self.set_preview(build_existing_files_preview(folder, code))
         self.monitor_folder()
 
     def stop_monitoring(self):
@@ -598,10 +520,9 @@ class BatchRenamerApp:
 
     def monitor_folder(self):
         try:
-            folder, code, rename_folders_enabled = self.current_settings()
+            folder, code = self.current_settings()
             all_files = collect_all_files(folder)
             pending_files = collect_pending_files(folder, code)
-            pending_folders = collect_pending_folders(folder, code) if rename_folders_enabled else []
 
             stable_files = []
             preview_map: Dict[str, str] = {}
@@ -613,15 +534,6 @@ class BatchRenamerApp:
                     preview_map[key] = f"[Named] FILE {relative_path}"
                 else:
                     preview_map[key] = f"[Detected] FILE {relative_path}"
-
-            if rename_folders_enabled:
-                for folder_path in collect_candidate_folders(folder):
-                    key = f"dir:{folder_path}"
-                    relative_path = str(folder_path.relative_to(folder))
-                    if is_named_for_code(folder_path, code):
-                        preview_map[key] = f"[Named] DIR  {relative_path}"
-                    else:
-                        preview_map[key] = f"[Detected] DIR  {relative_path}"
 
             for file_path in pending_files:
                 key = f"file:{file_path}"
@@ -652,19 +564,12 @@ class BatchRenamerApp:
                 for file_path in stable_files:
                     self.file_sizes.pop(f"file:{file_path}", None)
 
-            if rename_folders_enabled and pending_folders:
-                folder_logs = rename_folders(folder, code, folders=pending_folders)
-                if folder_logs != ["No matching folders found."]:
-                    for line in folder_logs:
-                        self.log(line)
-                    rename_count += len(pending_folders)
-
             if rename_count:
                 self.status_var.set(f"Detected and renamed {rename_count} item(s).")
             else:
                 self.status_var.set(f"Monitoring {folder}")
 
-            self.set_preview(build_existing_files_preview(folder, code, rename_folders_enabled))
+            self.set_preview(build_existing_files_preview(folder, code))
 
         except Exception as exc:
             self.status_var.set(f"Monitoring error: {exc}")
@@ -692,7 +597,6 @@ def run_cli(args):
     config = load_config()
     code = normalize_code(args.code or config.get("code"))
     folder = resolve_folder(args.folder, config)
-    rename_folders_enabled = args.rename_folders or config.get("rename_folders", DEFAULT_RENAME_FOLDERS)
 
     ensure_valid_folder(folder)
 
@@ -702,15 +606,10 @@ def run_cli(args):
     if args.save_folder:
         config["default_folder"] = str(folder)
         config["code"] = code
-        config["rename_folders"] = rename_folders_enabled
         save_config(config)
         print(f"Default folder saved: {folder}")
 
     logs = rename_files(folder, code, start=args.start, dry_run=args.dry_run)
-    if rename_folders_enabled:
-        folder_logs = rename_folders(folder, code, dry_run=args.dry_run)
-        if folder_logs != ["No matching folders found."]:
-            logs.extend(folder_logs)
     for line in logs:
         print(line)
 
