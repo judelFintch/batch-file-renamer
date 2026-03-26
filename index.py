@@ -1,6 +1,8 @@
 import argparse
 import json
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -25,12 +27,13 @@ DEFAULT_CODE = "FAC"
 MONITOR_INTERVAL_MS = 2000
 NUMBERED_NAME_PATTERN = re.compile(r"^(?P<code>[A-Z0-9]+)_(?P<number>\d+)$")
 DEFAULT_DOCUMENT_TYPES = {
-    "Facture": "FCM",
+    "Ordre a declarer": "OAD",
+    "Invoice": "FCM",
     "Packing List": "LCL",
-    "Assurance": "CAA",
     "Manifest": "MNF",
-    "Ordre a declarer": "ORD",
+    "Certificat d'assurance": "CAA",
 }
+DEFAULT_AUTO_RENAME = True
 
 
 RenamePlan = List[Tuple[Path, Path]]
@@ -111,6 +114,27 @@ def normalize_document_types(raw_document_types: Optional[Dict[str, str]]) -> Di
         normalized[cleaned_label] = normalize_code(str(code))
 
     return normalized or DEFAULT_DOCUMENT_TYPES.copy()
+
+
+def normalize_document_keywords(
+    raw_document_keywords: Optional[Dict[str, Sequence[str]]],
+    document_types: Dict[str, str],
+) -> Dict[str, List[str]]:
+    normalized = {label: [] for label in document_types}
+
+    if not raw_document_keywords:
+        return normalized
+
+    for label, keywords in raw_document_keywords.items():
+        if label not in document_types:
+            continue
+        if isinstance(keywords, str):
+            items = keywords.split(",")
+        else:
+            items = keywords
+        normalized[label] = [str(keyword).strip().lower() for keyword in items if str(keyword).strip()]
+
+    return normalized
 
 
 def resolve_folder(folder_arg: Optional[str], config: Dict[str, str]) -> Path:
@@ -310,6 +334,75 @@ def build_classified_rename_plan(
     return plan
 
 
+def extract_text_for_detection(file_path: Path) -> Tuple[str, str]:
+    if file_path.suffix.lower() in {".txt", ".csv"}:
+        return file_path.read_text(encoding="utf-8", errors="ignore"), "plain_text"
+
+    try:
+        textutil_result = subprocess.run(
+            ["textutil", "-convert", "txt", "-stdout", str(file_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        textutil_result = None
+    else:
+        if textutil_result.returncode == 0 and textutil_result.stdout.strip():
+            return textutil_result.stdout, "textutil"
+
+    if file_path.suffix.lower() == ".pdf":
+        try:
+            strings_result = subprocess.run(
+                ["strings", "-n", "6", str(file_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return "", "unreadable"
+        if strings_result.returncode == 0:
+            return strings_result.stdout, "strings"
+
+    return "", "unreadable"
+
+
+def ocr_is_available() -> bool:
+    return shutil.which("tesseract") is not None
+
+
+def detect_document_type(
+    file_path: Path,
+    document_types: Dict[str, str],
+    document_keywords: Dict[str, Sequence[str]],
+) -> Tuple[Optional[str], int, List[str], str]:
+    raw_text, extraction_method = extract_text_for_detection(file_path)
+    text = raw_text.lower()
+    if not text.strip():
+        if file_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"} and not ocr_is_available():
+            return None, 0, [], "ocr_missing"
+        if file_path.suffix.lower() == ".pdf" and not ocr_is_available():
+            return None, 0, [], f"no_text_extracted:{extraction_method}"
+        return None, 0, [], "no_text_extracted"
+
+    best_label = None
+    best_score = 0
+    best_matches: List[str] = []
+
+    for label in document_types:
+        matches = [keyword for keyword in document_keywords.get(label, []) if keyword and keyword in text]
+        score = len(matches)
+        if score > best_score:
+            best_label = label
+            best_score = score
+            best_matches = matches
+
+    if best_score == 0:
+        return None, 0, [], "no_keyword_match"
+
+    return best_label, best_score, best_matches, extraction_method
+
+
 class BatchRenamerApp:
     def __init__(self, root):
         self.root = root
@@ -318,6 +411,10 @@ class BatchRenamerApp:
 
         self.config = load_config()
         self.document_types = normalize_document_types(self.config.get("document_types"))
+        self.document_keywords = normalize_document_keywords(
+            self.config.get("document_keywords"),
+            self.document_types,
+        )
         self.monitoring = False
         self.monitor_after_id = None
         self.file_sizes: Dict[str, int] = {}
@@ -333,6 +430,8 @@ class BatchRenamerApp:
         self.document_type_var = tk.StringVar(value=next(iter(self.document_types)))
         self.type_label_var = tk.StringVar()
         self.type_code_var = tk.StringVar()
+        self.type_keywords_var = tk.StringVar()
+        self.auto_rename_var = tk.BooleanVar(value=self.config.get("auto_rename", DEFAULT_AUTO_RENAME))
         self.assignment_info_var = tk.StringVar(value="Select a file to classify.")
         self.status_var = tk.StringVar(value="Select a folder to start monitoring.")
 
@@ -363,6 +462,13 @@ class BatchRenamerApp:
 
         save_button = tk.Button(self.root, text="Save settings", command=self.save_settings)
         save_button.grid(row=2, column=2, sticky="ew", padx=(8, 16), pady=8)
+
+        auto_rename_check = tk.Checkbutton(
+            self.root,
+            text="Auto detect and rename",
+            variable=self.auto_rename_var,
+        )
+        auto_rename_check.grid(row=2, column=1, sticky="w", padx=8, pady=8)
 
         manual_folder_label = tk.Label(self.root, text="Folder to rename")
         manual_folder_label.grid(row=3, column=0, sticky="w", padx=16, pady=8)
@@ -397,7 +503,7 @@ class BatchRenamerApp:
         types_frame.columnconfigure(2, weight=1)
 
         self.types_listbox = tk.Listbox(types_frame, exportselection=False, height=5)
-        self.types_listbox.grid(row=0, column=0, rowspan=4, sticky="nsew", padx=(12, 8), pady=12)
+        self.types_listbox.grid(row=0, column=0, rowspan=6, sticky="nsew", padx=(12, 8), pady=12)
         self.types_listbox.bind("<<ListboxSelect>>", self.on_type_selection)
 
         type_label_label = tk.Label(types_frame, text="Label")
@@ -412,11 +518,17 @@ class BatchRenamerApp:
         type_code_entry = tk.Entry(types_frame, textvariable=self.type_code_var)
         type_code_entry.grid(row=1, column=2, sticky="ew", padx=(0, 12))
 
+        type_keywords_label = tk.Label(types_frame, text="Keywords")
+        type_keywords_label.grid(row=3, column=1, sticky="w", padx=(8, 12), pady=(8, 4))
+
+        type_keywords_entry = tk.Entry(types_frame, textvariable=self.type_keywords_var)
+        type_keywords_entry.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(8, 12))
+
         add_type_button = tk.Button(types_frame, text="Add / update", command=self.add_or_update_document_type)
-        add_type_button.grid(row=2, column=1, sticky="ew", padx=(8, 12), pady=(8, 12))
+        add_type_button.grid(row=5, column=1, sticky="ew", padx=(8, 12), pady=(8, 12))
 
         delete_type_button = tk.Button(types_frame, text="Delete", command=self.delete_document_type)
-        delete_type_button.grid(row=2, column=2, sticky="ew", padx=(0, 12), pady=(8, 12))
+        delete_type_button.grid(row=5, column=2, sticky="ew", padx=(0, 12), pady=(8, 12))
 
         classification_frame = tk.LabelFrame(self.root, text="Document classification")
         classification_frame.grid(row=6, column=0, columnspan=3, sticky="nsew", padx=16, pady=(0, 8))
@@ -552,6 +664,8 @@ class BatchRenamerApp:
 
         self.config["default_folder"] = str(folder)
         self.config["document_types"] = self.document_types
+        self.config["document_keywords"] = self.document_keywords
+        self.config["auto_rename"] = self.auto_rename_var.get()
         save_config(self.config)
         self.status_var.set(f"Settings saved for {folder}")
         self.log(f"Saved folder: {folder}")
@@ -629,6 +743,7 @@ class BatchRenamerApp:
             if not self.type_label_var.get().strip():
                 self.type_label_var.set(self.document_type_var.get())
                 self.type_code_var.set(self.document_types[self.document_type_var.get()])
+                self.type_keywords_var.set(", ".join(self.document_keywords.get(self.document_type_var.get(), [])))
 
     def on_type_selection(self, _event=None):
         selection = self.types_listbox.curselection()
@@ -638,6 +753,7 @@ class BatchRenamerApp:
         label = list(self.document_types.keys())[selection[0]]
         self.type_label_var.set(label)
         self.type_code_var.set(self.document_types[label])
+        self.type_keywords_var.set(", ".join(self.document_keywords.get(label, [])))
         self.document_type_var.set(label)
 
     def add_or_update_document_type(self):
@@ -654,9 +770,12 @@ class BatchRenamerApp:
             messagebox.showerror("Document type error", str(exc))
             return
 
+        keywords = [keyword.strip().lower() for keyword in self.type_keywords_var.get().split(",") if keyword.strip()]
         self.document_types[label] = code
+        self.document_keywords[label] = keywords
         self.refresh_document_type_widgets()
         self.config["document_types"] = self.document_types
+        self.config["document_keywords"] = self.document_keywords
         save_config(self.config)
         try:
             folder = self.current_settings()
@@ -678,6 +797,7 @@ class BatchRenamerApp:
 
         label = list(self.document_types.keys())[selection[0]]
         self.document_types.pop(label, None)
+        self.document_keywords.pop(label, None)
 
         keys_to_remove = [
             key for key, assigned_label in self.pending_assignments.items() if assigned_label == label
@@ -687,8 +807,10 @@ class BatchRenamerApp:
 
         self.type_label_var.set("")
         self.type_code_var.set("")
+        self.type_keywords_var.set("")
         self.refresh_document_type_widgets()
         self.config["document_types"] = self.document_types
+        self.config["document_keywords"] = self.document_keywords
         save_config(self.config)
         self.assignment_info_var.set("Select a file to classify.")
         try:
@@ -833,6 +955,55 @@ class BatchRenamerApp:
         self.set_preview(build_existing_files_preview(folder, self.known_codes()))
         self.status_var.set(f"Renamed {len(files_to_rename)} classified file(s).")
 
+    def auto_detect_ready_files(self, folder: Path, ready_files: Sequence[Path]):
+        auto_assignments: Dict[str, str] = {}
+        detected_count = 0
+
+        for file_path in ready_files:
+            label, score, matches, detection_status = detect_document_type(
+                file_path,
+                self.document_types,
+                self.document_keywords,
+            )
+            key = str(file_path)
+            if label is None:
+                if detection_status == "ocr_missing":
+                    self.pending_statuses[key] = "OCR missing"
+                    self.log(f"OCR not available for {file_path.name}. Install tesseract to read scanned images.")
+                elif detection_status.startswith("no_text_extracted"):
+                    self.pending_statuses[key] = "No text"
+                    self.log(f"No readable text found in {file_path.name}. OCR could not be applied.")
+                else:
+                    self.pending_statuses[key] = "Review"
+                    self.log(f"No keyword match found for {file_path.name}. Check the configured keywords.")
+                continue
+
+            auto_assignments[key] = label
+            self.pending_statuses[key] = "Auto"
+            detected_count += 1
+            self.log(
+                f"Auto-detected {file_path.name} as {label} ({self.document_types[label]}) using: {', '.join(matches[:3])}"
+            )
+
+        if not auto_assignments:
+            return 0
+
+        files_to_rename = [file_path for file_path in ready_files if str(file_path) in auto_assignments]
+        plan = build_classified_rename_plan(folder, files_to_rename, auto_assignments, self.document_types)
+        validate_plan(plan)
+        logs = apply_plan(plan, dry_run=False)
+
+        for line in logs:
+            self.log(line)
+
+        for file_path in files_to_rename:
+            key = str(file_path)
+            self.pending_assignments.pop(key, None)
+            self.pending_statuses.pop(key, None)
+            self.file_sizes.pop(f"file:{file_path}", None)
+
+        return detected_count
+
     def toggle_monitoring(self):
         if self.monitoring:
             self.stop_monitoring()
@@ -879,6 +1050,7 @@ class BatchRenamerApp:
             all_files = collect_all_files(folder)
             pending_files = collect_pending_files_for_codes(folder, self.known_codes())
             preview_map: Dict[str, str] = {}
+            ready_files: List[Path] = []
 
             for file_path in all_files:
                 key = f"file:{file_path}"
@@ -897,6 +1069,7 @@ class BatchRenamerApp:
                 if previous_size is not None and previous_size == size:
                     preview_map[key] = f"[Ready] FILE {relative_path}"
                     self.pending_statuses[str(file_path)] = "Ready"
+                    ready_files.append(file_path)
                 else:
                     self.file_sizes[key] = size
                     preview_map[key] = f"[Writing] FILE {relative_path}"
@@ -907,9 +1080,20 @@ class BatchRenamerApp:
             }
             self.preview_files = preview_map
             self.render_monitoring_output()
+
+            auto_renamed = 0
+            if self.auto_rename_var.get() and ready_files:
+                try:
+                    auto_renamed = self.auto_detect_ready_files(folder, ready_files)
+                except Exception as exc:
+                    self.log(f"Automatic detection error: {exc}")
+
             self.refresh_pending_list(folder)
             ready_count = sum(1 for file_path in pending_files if self.pending_statuses.get(str(file_path)) == "Ready")
-            self.status_var.set(f"Monitoring {folder} | {ready_count} file(s) ready for classification")
+            if auto_renamed:
+                self.status_var.set(f"Monitoring {folder} | {auto_renamed} file(s) auto-renamed")
+            else:
+                self.status_var.set(f"Monitoring {folder} | {ready_count} file(s) ready for classification")
             self.set_preview(build_existing_files_preview(folder, self.known_codes()))
 
         except Exception as exc:
