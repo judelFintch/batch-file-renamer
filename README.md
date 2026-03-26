@@ -40,8 +40,9 @@ python3 index.py --gui
 The interface lets you:
 
 - browse and select the folder used by the scanner
-- enter an acronym such as `FAC`, `CLI`, `ORD`, `BL`
-- save the settings
+- open a dedicated `Configuration` window for settings and API parameters
+- open a dedicated `Learn Files` window for study files and learned samples
+- optionally enable an AI agent workflow for autonomous routing and renaming review
 - rename current files immediately
 - start or stop automatic monitoring
 
@@ -74,6 +75,10 @@ This prevents renaming a file while the scanner is still writing it.
 
 For scanned images and image-only PDFs, the app will try OCR through `tesseract` when no embedded text is available.
 
+You can also train each document type from multiple real sample files. The app stores all learned references, lets you remove a bad sample, and uses the strongest matching examples to classify future scans.
+
+You can store the real API settings directly in the `Configuration` window, including the API token, model, and responses URL. The AI agent reads the extracted text, compares it with your learned references, auto-renames high-confidence files, and sends medium-confidence files to human review.
+
 ## Naming Format
 
 The app renames files like this:
@@ -98,11 +103,11 @@ The current code is important:
 ## Basic GUI Workflow
 
 1. Run `python3 index.py`
-2. Click `Browse`
-3. Select the parent folder used by the scanner
-4. Enter your acronym, for example `FAC`
-5. Click `Save settings`
-6. Click `Rename now` to rename existing files already present
+2. Click `Configuration`
+3. Select the parent folder used by the scanner and save the settings
+4. If needed, add the API token, model, and thresholds
+5. Click `Learn Files` and upload sample documents for each rename target
+6. Review detected files in the renaming area
 7. Leave monitoring enabled for future scans
 
 ## Saved Settings
@@ -184,3 +189,8 @@ Options:
 Optional for scanned images and image-only PDFs:
 
 - `tesseract`
+
+Optional for the AI agent workflow:
+
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL` to override the default model (`gpt-4o-mini`)

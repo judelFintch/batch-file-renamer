@@ -1,22 +1,27 @@
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import unicodedata
+import urllib.error
+import urllib.request
+from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, scrolledtext
+    from tkinter import filedialog, messagebox, scrolledtext, simpledialog
     from tkinter import ttk
 except ModuleNotFoundError as exc:
     tk = None
     filedialog = None
     messagebox = None
     scrolledtext = None
+    simpledialog = None
     ttk = None
     TK_IMPORT_ERROR = exc
 else:
@@ -35,8 +40,44 @@ DEFAULT_DOCUMENT_TYPES = {
     "Certificat d'assurance": "CAA",
 }
 DEFAULT_AUTO_RENAME = True
+DEFAULT_AI_AGENT_ENABLED = False
+DEFAULT_AI_REVIEW_THRESHOLD = 0.65
+DEFAULT_AI_AUTO_RENAME_THRESHOLD = 0.85
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 AUTO_DETECT_MIN_SCORE = 2
 AUTO_DETECT_MIN_MARGIN = 1
+REFERENCE_TERM_LIMIT = 24
+REFERENCE_PHRASE_LIMIT = 18
+REFERENCE_LINE_LIMIT = 6
+REFERENCE_SCORE_THRESHOLD = 6
+COMMON_REFERENCE_STOPWORDS = {
+    "avec",
+    "avoir",
+    "bill",
+    "cette",
+    "chez",
+    "code",
+    "comment",
+    "dans",
+    "date",
+    "document",
+    "dont",
+    "elle",
+    "from",
+    "have",
+    "nous",
+    "nous",
+    "page",
+    "pour",
+    "reference",
+    "sera",
+    "sont",
+    "that",
+    "this",
+    "votre",
+    "vous",
+}
 
 
 RenamePlan = List[Tuple[Path, Path]]
@@ -140,6 +181,42 @@ def normalize_document_keywords(
     return normalized
 
 
+def normalize_document_reference_samples(
+    raw_reference_samples: Optional[Dict[str, Sequence[Dict[str, Any]]]],
+    document_types: Dict[str, str],
+) -> Dict[str, List[Dict[str, Any]]]:
+    normalized = {label: [] for label in document_types}
+
+    if not raw_reference_samples:
+        return normalized
+
+    for label, samples in raw_reference_samples.items():
+        if label not in document_types or not isinstance(samples, Sequence):
+            continue
+
+        cleaned_samples: List[Dict[str, Any]] = []
+        for sample in samples:
+            if not isinstance(sample, dict):
+                continue
+
+            cleaned_sample = {
+                "name": str(sample.get("name", "")).strip(),
+                "source": str(sample.get("source", "")).strip(),
+                "extraction_method": str(sample.get("extraction_method", "")).strip(),
+                "rename_label": str(sample.get("rename_label", "")).strip(),
+                "rename_code": str(sample.get("rename_code", "")).strip(),
+                "terms": [str(item).strip() for item in sample.get("terms", []) if str(item).strip()],
+                "phrases": [str(item).strip() for item in sample.get("phrases", []) if str(item).strip()],
+                "lines": [str(item).strip() for item in sample.get("lines", []) if str(item).strip()],
+            }
+            if cleaned_sample["terms"] or cleaned_sample["phrases"] or cleaned_sample["lines"]:
+                cleaned_samples.append(cleaned_sample)
+
+        normalized[label] = cleaned_samples
+
+    return normalized
+
+
 def normalize_text_for_matching(text: str) -> str:
     ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"\s+", " ", ascii_text.lower()).strip()
@@ -147,6 +224,243 @@ def normalize_text_for_matching(text: str) -> str:
 
 def split_keyword_tokens(keyword: str) -> List[str]:
     return [token for token in re.split(r"[^a-z0-9]+", normalize_text_for_matching(keyword)) if token]
+
+
+def extract_reference_tokens(text: str) -> List[str]:
+    normalized_text = normalize_text_for_matching(text)
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", normalized_text)
+        if len(token) >= 4 and not token.isdigit() and token not in COMMON_REFERENCE_STOPWORDS
+    ]
+
+
+def build_reference_sample(
+    file_path: Path,
+    text: str,
+    extraction_method: str,
+    rename_label: str,
+    rename_code: str,
+) -> Dict[str, Any]:
+    tokens = extract_reference_tokens(text)
+    token_counts = Counter(tokens)
+
+    phrase_counts: Counter[str] = Counter()
+    for size in (2, 3):
+        for index in range(len(tokens) - size + 1):
+            phrase_tokens = tokens[index:index + size]
+            if all(token in COMMON_REFERENCE_STOPWORDS for token in phrase_tokens):
+                continue
+            phrase_counts[" ".join(phrase_tokens)] += 1
+
+    normalized_lines = []
+    for raw_line in text.splitlines():
+        line = normalize_text_for_matching(raw_line)
+        if 8 <= len(line) <= 90:
+            normalized_lines.append(line)
+
+    return {
+        "name": file_path.name,
+        "source": str(file_path),
+        "extraction_method": extraction_method,
+        "rename_label": rename_label,
+        "rename_code": rename_code,
+        "terms": [term for term, _ in token_counts.most_common(REFERENCE_TERM_LIMIT)],
+        "phrases": [
+            phrase
+            for phrase, _ in sorted(
+                phrase_counts.items(),
+                key=lambda item: (-item[1], -len(item[0]), item[0]),
+            )[:REFERENCE_PHRASE_LIMIT]
+        ],
+        "lines": list(dict.fromkeys(normalized_lines))[:REFERENCE_LINE_LIMIT],
+    }
+
+
+def summarize_reference_samples(samples: Sequence[Dict[str, Any]]) -> Dict[str, List[str]]:
+    term_counts: Counter[str] = Counter()
+    phrase_counts: Counter[str] = Counter()
+    line_counts: Counter[str] = Counter()
+
+    for sample in samples:
+        term_counts.update(sample.get("terms", []))
+        phrase_counts.update(sample.get("phrases", []))
+        line_counts.update(sample.get("lines", []))
+
+    return {
+        "terms": [term for term, _ in term_counts.most_common(REFERENCE_TERM_LIMIT)],
+        "phrases": [phrase for phrase, _ in phrase_counts.most_common(REFERENCE_PHRASE_LIMIT)],
+        "lines": [line for line, _ in line_counts.most_common(REFERENCE_LINE_LIMIT)],
+    }
+
+
+def build_reference_summary_for_prompt(
+    document_types: Dict[str, str],
+    document_keywords: Dict[str, Sequence[str]],
+    document_reference_samples: Dict[str, Sequence[Dict[str, Any]]],
+) -> Dict[str, Dict[str, Any]]:
+    summary: Dict[str, Dict[str, Any]] = {}
+    for label, code in document_types.items():
+        samples = document_reference_samples.get(label, [])
+        aggregated = summarize_reference_samples(samples)
+        summary[label] = {
+            "rename_code": code,
+            "keywords": list(document_keywords.get(label, []))[:12],
+            "sample_count": len(samples),
+            "top_terms": aggregated["terms"][:12],
+            "top_phrases": aggregated["phrases"][:8],
+            "top_lines": aggregated["lines"][:4],
+        }
+    return summary
+
+
+def extract_response_text(response_payload: Dict[str, Any]) -> str:
+    output_items = response_payload.get("output", [])
+    for item in output_items:
+        if item.get("type") != "message":
+            continue
+        for content_item in item.get("content", []):
+            if content_item.get("type") == "output_text":
+                return content_item.get("text", "")
+            if content_item.get("type") == "refusal":
+                return json.dumps({"action": "review", "reason": content_item.get("refusal", "refusal")})
+    return ""
+
+
+def ask_ai_agent_to_classify(
+    file_path: Path,
+    extracted_text: str,
+    extraction_method: str,
+    document_types: Dict[str, str],
+    document_keywords: Dict[str, Sequence[str]],
+    document_reference_samples: Dict[str, Sequence[Dict[str, Any]]],
+    api_key: str,
+    model: str,
+    endpoint_url: str,
+) -> Dict[str, Any]:
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured.")
+
+    prompt_payload = {
+        "filename": file_path.name,
+        "suffix": file_path.suffix.lower(),
+        "extraction_method": extraction_method,
+        "document_targets": build_reference_summary_for_prompt(
+            document_types,
+            document_keywords,
+            document_reference_samples,
+        ),
+        "document_text": extracted_text[:12000],
+    }
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["auto_rename", "review", "reject"],
+            },
+            "rename_label": {"type": ["string", "null"]},
+            "rename_code": {"type": ["string", "null"]},
+            "confidence": {"type": "number"},
+            "reason": {"type": "string"},
+            "matched_evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["action", "rename_label", "rename_code", "confidence", "reason", "matched_evidence"],
+        "additionalProperties": False,
+    }
+
+    request_body = {
+        "model": model,
+        "input": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a document-routing agent. "
+                    "Choose only among the provided rename targets. "
+                    "Use action='auto_rename' only when evidence is strong. "
+                    "Use action='review' when there is some signal but a human should confirm. "
+                    "Use action='reject' when the document does not fit any known target. "
+                    "Confidence must be between 0 and 1."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(prompt_payload, ensure_ascii=True),
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "document_routing_decision",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+    }
+
+    request = urllib.request.Request(
+        endpoint_url,
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            raw_response = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"AI agent request failed: {exc.code} {error_body}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"AI agent request failed: {exc.reason}") from exc
+
+    response_payload = json.loads(raw_response)
+    response_text = extract_response_text(response_payload).strip()
+    if not response_text:
+        raise RuntimeError("AI agent returned an empty response.")
+
+    decision = json.loads(response_text)
+    if decision.get("rename_label") and decision["rename_label"] not in document_types:
+        decision["action"] = "review"
+        decision["reason"] = "AI proposed an unknown rename target."
+    return decision
+
+
+def score_reference_sample(
+    sample: Dict[str, Any],
+    text: str,
+    text_tokens: Sequence[str],
+) -> Tuple[int, List[str]]:
+    score = 0
+    matches: List[str] = []
+    token_set = set(text_tokens)
+
+    for phrase in sample.get("phrases", []):
+        if phrase and phrase in text:
+            matches.append(f"ref:{phrase}")
+            score += 4
+
+    for line in sample.get("lines", []):
+        if line and line in text:
+            matches.append(f"line:{line[:40]}")
+            score += 5
+
+    for term in sample.get("terms", []):
+        if term and term in token_set:
+            matches.append(f"term:{term}")
+            score += 2
+
+    if score and len(matches) >= 3:
+        score += min(4, len(matches) - 2)
+
+    return score, matches[:5]
 
 
 def resolve_folder(folder_arg: Optional[str], config: Dict[str, str]) -> Path:
@@ -407,6 +721,7 @@ def detect_document_type(
     file_path: Path,
     document_types: Dict[str, str],
     document_keywords: Dict[str, Sequence[str]],
+    document_reference_samples: Optional[Dict[str, Sequence[Dict[str, Any]]]] = None,
 ) -> Tuple[Optional[str], int, List[str], str]:
     raw_text, extraction_method = extract_text_for_detection(file_path)
     text = normalize_text_for_matching(raw_text)
@@ -425,6 +740,7 @@ def detect_document_type(
     best_score = 0
     best_matches: List[str] = []
     second_best_score = 0
+    text_tokens = extract_reference_tokens(text)
 
     for label in document_types:
         matches: List[str] = []
@@ -445,6 +761,22 @@ def detect_document_type(
                 matches.append(keyword)
                 score += 1
 
+        if document_reference_samples:
+            sample_scores: List[Tuple[int, List[str], str]] = []
+            for sample in document_reference_samples.get(label, []):
+                sample_score, sample_matches = score_reference_sample(sample, text, text_tokens)
+                if sample_score > 0:
+                    sample_scores.append((sample_score, sample_matches, sample.get("name", "reference")))
+
+            sample_scores.sort(key=lambda item: item[0], reverse=True)
+            for sample_score, sample_matches, sample_name in sample_scores[:3]:
+                score += sample_score
+                matches.append(f"sample:{sample_name}")
+                matches.extend(sample_matches[:2])
+
+            if len(sample_scores) >= 2:
+                score += 2
+
         if score > best_score:
             second_best_score = best_score
             best_label = label
@@ -453,16 +785,21 @@ def detect_document_type(
         elif score > second_best_score:
             second_best_score = score
 
+    if best_score < REFERENCE_SCORE_THRESHOLD and not any(
+        document_keywords.get(label) for label in document_types
+    ) and document_reference_samples:
+        return None, best_score, best_matches[:5], "low_confidence"
+
     if best_score < AUTO_DETECT_MIN_SCORE:
-        return None, best_score, best_matches, "low_confidence"
+        return None, best_score, best_matches[:5], "low_confidence"
 
     if best_score - second_best_score < AUTO_DETECT_MIN_MARGIN:
-        return None, best_score, best_matches, "ambiguous_match"
+        return None, best_score, best_matches[:5], "ambiguous_match"
 
     if best_score == 0:
         return None, 0, [], "no_keyword_match"
 
-    return best_label, best_score, best_matches, extraction_method
+    return best_label, best_score, best_matches[:5], extraction_method
 
 
 def extract_text_preview(file_path: Path) -> Tuple[str, str]:
@@ -489,6 +826,10 @@ class BatchRenamerApp:
             self.config.get("document_keywords"),
             self.document_types,
         )
+        self.document_reference_samples = normalize_document_reference_samples(
+            self.config.get("document_reference_samples"),
+            self.document_types,
+        )
         self.monitoring = False
         self.monitor_after_id = None
         self.file_sizes: Dict[str, int] = {}
@@ -508,8 +849,24 @@ class BatchRenamerApp:
         self.type_code_var = tk.StringVar()
         self.type_keywords_var = tk.StringVar()
         self.auto_rename_var = tk.BooleanVar(value=self.config.get("auto_rename", DEFAULT_AUTO_RENAME))
+        self.ai_agent_var = tk.BooleanVar(value=self.config.get("ai_agent_enabled", DEFAULT_AI_AGENT_ENABLED))
+        self.ai_review_threshold_var = tk.StringVar(
+            value=str(self.config.get("ai_review_threshold", DEFAULT_AI_REVIEW_THRESHOLD))
+        )
+        self.ai_auto_threshold_var = tk.StringVar(
+            value=str(self.config.get("ai_auto_rename_threshold", DEFAULT_AI_AUTO_RENAME_THRESHOLD))
+        )
+        self.api_key_var = tk.StringVar(value=self.config.get("openai_api_key", os.environ.get("OPENAI_API_KEY", "")))
+        self.api_model_var = tk.StringVar(value=self.config.get("openai_model", DEFAULT_OPENAI_MODEL))
+        self.api_url_var = tk.StringVar(value=self.config.get("openai_responses_url", DEFAULT_OPENAI_RESPONSES_URL))
         self.assignment_info_var = tk.StringVar(value="Select a file to classify.")
+        self.reference_info_var = tk.StringVar(value="No reference selected.")
         self.status_var = tk.StringVar(value="Select a folder to start monitoring.")
+        self.settings_window = None
+        self.learning_window = None
+        self.types_listbox = None
+        self.reference_listbox = None
+        self.extracted_text_widget = None
 
         self.build_ui()
 
@@ -518,7 +875,7 @@ class BatchRenamerApp:
 
     def build_ui(self):
         self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(6, weight=1)
+        self.root.rowconfigure(5, weight=1)
 
         title = tk.Label(
             self.root,
@@ -536,88 +893,41 @@ class BatchRenamerApp:
         browse_button = tk.Button(self.root, text="Browse", command=self.select_folder)
         browse_button.grid(row=1, column=2, sticky="ew", padx=(8, 16), pady=8)
 
-        save_button = tk.Button(self.root, text="Save settings", command=self.save_settings)
-        save_button.grid(row=2, column=2, sticky="ew", padx=(8, 16), pady=8)
+        actions_frame = tk.Frame(self.root)
+        actions_frame.grid(row=2, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 8))
+        actions_frame.columnconfigure(0, weight=1)
+        actions_frame.columnconfigure(1, weight=1)
+        actions_frame.columnconfigure(2, weight=1)
 
-        auto_rename_check = tk.Checkbutton(
-            self.root,
-            text="Auto detect and rename",
-            variable=self.auto_rename_var,
-        )
-        auto_rename_check.grid(row=2, column=1, sticky="w", padx=8, pady=8)
+        settings_button = tk.Button(actions_frame, text="Configuration", command=self.open_settings_window)
+        settings_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
-        manual_folder_label = tk.Label(self.root, text="Folder to rename")
-        manual_folder_label.grid(row=3, column=0, sticky="w", padx=16, pady=8)
+        learning_button = tk.Button(actions_frame, text="Learn Files", command=self.open_learning_window)
+        learning_button.grid(row=0, column=1, sticky="ew", padx=8)
 
-        manual_folder_entry = tk.Entry(self.root, textvariable=self.manual_folder_var)
-        manual_folder_entry.grid(row=3, column=1, sticky="ew", padx=8, pady=8)
+        manual_rename_button = tk.Button(actions_frame, text="Rename Folder", command=self.open_settings_window)
+        manual_rename_button.grid(row=0, column=2, sticky="ew", padx=(8, 0))
 
-        manual_folder_button = tk.Button(
-            self.root,
-            text="Choose folder",
-            command=self.select_manual_folder,
-        )
-        manual_folder_button.grid(row=3, column=2, sticky="ew", padx=(8, 16), pady=8)
-
-        manual_name_label = tk.Label(self.root, text="New folder name")
-        manual_name_label.grid(row=4, column=0, sticky="w", padx=16, pady=8)
-
-        manual_name_entry = tk.Entry(self.root, textvariable=self.manual_folder_name_var)
-        manual_name_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=8)
-
-        manual_rename_button = tk.Button(
-            self.root,
-            text="Rename folder",
-            command=self.rename_selected_folder,
-        )
-        manual_rename_button.grid(row=4, column=2, sticky="ew", padx=(8, 16), pady=8)
-
-        types_frame = tk.LabelFrame(self.root, text="Document types")
-        types_frame.grid(row=5, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 8))
-        types_frame.columnconfigure(0, weight=1)
-        types_frame.columnconfigure(1, weight=1)
-        types_frame.columnconfigure(2, weight=1)
-
-        self.types_listbox = tk.Listbox(types_frame, exportselection=False, height=5)
-        self.types_listbox.grid(row=0, column=0, rowspan=6, sticky="nsew", padx=(12, 8), pady=12)
-        self.types_listbox.bind("<<ListboxSelect>>", self.on_type_selection)
-
-        type_label_label = tk.Label(types_frame, text="Label")
-        type_label_label.grid(row=0, column=1, sticky="w", padx=(8, 12), pady=(12, 4))
-
-        type_label_entry = tk.Entry(types_frame, textvariable=self.type_label_var)
-        type_label_entry.grid(row=1, column=1, sticky="ew", padx=(8, 12))
-
-        type_code_label = tk.Label(types_frame, text="Code")
-        type_code_label.grid(row=0, column=2, sticky="w", padx=(0, 12), pady=(12, 4))
-
-        type_code_entry = tk.Entry(types_frame, textvariable=self.type_code_var)
-        type_code_entry.grid(row=1, column=2, sticky="ew", padx=(0, 12))
-
-        type_keywords_label = tk.Label(types_frame, text="Keywords")
-        type_keywords_label.grid(row=3, column=1, sticky="w", padx=(8, 12), pady=(8, 4))
-
-        type_keywords_entry = tk.Entry(types_frame, textvariable=self.type_keywords_var)
-        type_keywords_entry.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(8, 12))
-
-        add_type_button = tk.Button(types_frame, text="Add / update", command=self.add_or_update_document_type)
-        add_type_button.grid(row=5, column=1, sticky="ew", padx=(8, 12), pady=(8, 12))
-
-        delete_type_button = tk.Button(types_frame, text="Delete", command=self.delete_document_type)
-        delete_type_button.grid(row=5, column=2, sticky="ew", padx=(0, 12), pady=(8, 12))
-
-        classification_frame = tk.LabelFrame(self.root, text="Document classification")
-        classification_frame.grid(row=6, column=0, columnspan=3, sticky="nsew", padx=16, pady=(0, 8))
+        classification_frame = tk.LabelFrame(self.root, text="Renaming")
+        classification_frame.grid(row=5, column=0, columnspan=3, sticky="nsew", padx=16, pady=(0, 8))
         classification_frame.columnconfigure(0, weight=1)
         classification_frame.columnconfigure(1, weight=0)
         classification_frame.columnconfigure(2, weight=1)
         classification_frame.rowconfigure(1, weight=1)
 
-        queue_label = tk.Label(classification_frame, text="New files waiting for a document code")
-        queue_label.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 6))
+        rename_intro = tk.Label(
+            classification_frame,
+            text="Use this area only for files detected in the scan folder and ready to be renamed.",
+            anchor="w",
+            justify="left",
+        )
+        rename_intro.grid(row=0, column=0, columnspan=3, sticky="ew", padx=12, pady=(10, 0))
+
+        queue_label = tk.Label(classification_frame, text="Detected files waiting for a rename target")
+        queue_label.grid(row=1, column=0, sticky="w", padx=12, pady=(10, 6))
 
         queue_frame = tk.Frame(classification_frame)
-        queue_frame.grid(row=1, column=0, sticky="nsew", padx=(12, 8), pady=(0, 12))
+        queue_frame.grid(row=2, column=0, sticky="nsew", padx=(12, 8), pady=(0, 12))
         queue_frame.columnconfigure(0, weight=1)
         queue_frame.rowconfigure(0, weight=1)
 
@@ -630,7 +940,7 @@ class BatchRenamerApp:
         self.pending_listbox.configure(yscrollcommand=pending_scrollbar.set)
 
         assignment_frame = tk.Frame(classification_frame)
-        assignment_frame.grid(row=1, column=1, sticky="ns", padx=(8, 12), pady=(0, 12))
+        assignment_frame.grid(row=2, column=1, sticky="ns", padx=(8, 12), pady=(0, 12))
 
         document_type_label = tk.Label(assignment_frame, text="Document type")
         document_type_label.grid(row=0, column=0, sticky="w")
@@ -668,7 +978,7 @@ class BatchRenamerApp:
         assignment_info_label.grid(row=4, column=0, sticky="ew")
 
         extracted_text_frame = tk.Frame(classification_frame)
-        extracted_text_frame.grid(row=1, column=2, sticky="nsew", padx=(0, 12), pady=(0, 12))
+        extracted_text_frame.grid(row=2, column=2, sticky="nsew", padx=(0, 12), pady=(0, 12))
         extracted_text_frame.columnconfigure(0, weight=1)
         extracted_text_frame.rowconfigure(1, weight=1)
 
@@ -682,9 +992,10 @@ class BatchRenamerApp:
             state="disabled",
         )
         self.extracted_text_widget.grid(row=1, column=0, sticky="nsew")
+        self.show_extracted_text("No file selected.")
 
         controls = tk.Frame(self.root)
-        controls.grid(row=7, column=0, columnspan=3, sticky="nsew", padx=16, pady=(0, 16))
+        controls.grid(row=6, column=0, columnspan=3, sticky="nsew", padx=16, pady=(0, 16))
         controls.columnconfigure(0, weight=1)
         controls.rowconfigure(1, weight=1)
 
@@ -708,7 +1019,6 @@ class BatchRenamerApp:
         self.log_text.bind("<Key>", self.prevent_log_edit)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.refresh_document_type_widgets()
 
     def log(self, message: str):
         self.activity_logs.append(message)
@@ -726,10 +1036,176 @@ class BatchRenamerApp:
             self.log(message)
 
     def show_extracted_text(self, text: str):
+        if self.extracted_text_widget is None:
+            return
         self.extracted_text_widget.configure(state="normal")
         self.extracted_text_widget.delete("1.0", "end")
         self.extracted_text_widget.insert("1.0", text)
         self.extracted_text_widget.configure(state="disabled")
+
+    def open_settings_window(self):
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.deiconify()
+            self.settings_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Configuration")
+        window.geometry("760x520")
+        window.columnconfigure(1, weight=1)
+        self.settings_window = window
+
+        tk.Label(window, text="Configuration", font=("Helvetica", 16, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(16, 12)
+        )
+
+        tk.Label(window, text="Scanner folder").grid(row=1, column=0, sticky="w", padx=16, pady=8)
+        tk.Entry(window, textvariable=self.folder_var).grid(row=1, column=1, sticky="ew", padx=8, pady=8)
+        tk.Button(window, text="Browse", command=self.select_folder).grid(
+            row=1, column=2, sticky="ew", padx=(8, 16), pady=8
+        )
+
+        tk.Checkbutton(window, text="Auto detect and rename", variable=self.auto_rename_var).grid(
+            row=2, column=0, sticky="w", padx=16, pady=8
+        )
+        tk.Checkbutton(window, text="Use AI agent workflow", variable=self.ai_agent_var).grid(
+            row=2, column=1, sticky="w", padx=8, pady=8
+        )
+
+        tk.Label(window, text="AI review threshold").grid(row=3, column=0, sticky="w", padx=16, pady=8)
+        tk.Entry(window, textvariable=self.ai_review_threshold_var).grid(
+            row=3, column=1, sticky="ew", padx=8, pady=8
+        )
+        tk.Label(window, text="AI auto threshold").grid(row=4, column=0, sticky="w", padx=16, pady=8)
+        tk.Entry(window, textvariable=self.ai_auto_threshold_var).grid(
+            row=4, column=1, sticky="ew", padx=8, pady=8
+        )
+
+        api_frame = tk.LabelFrame(window, text="API")
+        api_frame.grid(row=5, column=0, columnspan=3, sticky="ew", padx=16, pady=(8, 8))
+        api_frame.columnconfigure(1, weight=1)
+
+        tk.Label(api_frame, text="API token").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 8))
+        tk.Entry(api_frame, textvariable=self.api_key_var, show="*").grid(
+            row=0, column=1, sticky="ew", padx=(8, 12), pady=(12, 8)
+        )
+        tk.Label(api_frame, text="Model").grid(row=1, column=0, sticky="w", padx=12, pady=8)
+        tk.Entry(api_frame, textvariable=self.api_model_var).grid(
+            row=1, column=1, sticky="ew", padx=(8, 12), pady=8
+        )
+        tk.Label(api_frame, text="Responses URL").grid(row=2, column=0, sticky="w", padx=12, pady=(8, 12))
+        tk.Entry(api_frame, textvariable=self.api_url_var).grid(
+            row=2, column=1, sticky="ew", padx=(8, 12), pady=(8, 12)
+        )
+
+        manual_frame = tk.LabelFrame(window, text="Folder renaming")
+        manual_frame.grid(row=6, column=0, columnspan=3, sticky="ew", padx=16, pady=(8, 8))
+        manual_frame.columnconfigure(1, weight=1)
+        tk.Label(manual_frame, text="Folder to rename").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 8))
+        tk.Entry(manual_frame, textvariable=self.manual_folder_var).grid(
+            row=0, column=1, sticky="ew", padx=8, pady=(12, 8)
+        )
+        tk.Button(manual_frame, text="Choose folder", command=self.select_manual_folder).grid(
+            row=0, column=2, sticky="ew", padx=(8, 12), pady=(12, 8)
+        )
+        tk.Label(manual_frame, text="New folder name").grid(row=1, column=0, sticky="w", padx=12, pady=(0, 12))
+        tk.Entry(manual_frame, textvariable=self.manual_folder_name_var).grid(
+            row=1, column=1, sticky="ew", padx=8, pady=(0, 12)
+        )
+        tk.Button(manual_frame, text="Rename folder", command=self.rename_selected_folder).grid(
+            row=1, column=2, sticky="ew", padx=(8, 12), pady=(0, 12)
+        )
+
+        tk.Button(window, text="Save configuration", command=self.save_settings).grid(
+            row=7, column=2, sticky="ew", padx=(8, 16), pady=(8, 16)
+        )
+        window.protocol("WM_DELETE_WINDOW", self.close_settings_window)
+
+    def close_settings_window(self):
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.destroy()
+        self.settings_window = None
+
+    def open_learning_window(self):
+        if self.learning_window is not None and self.learning_window.winfo_exists():
+            self.learning_window.deiconify()
+            self.learning_window.lift()
+            self.refresh_document_type_widgets()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Learn Files")
+        window.geometry("980x560")
+        window.columnconfigure(0, weight=1)
+        self.learning_window = window
+
+        tk.Label(window, text="Learn Files", font=("Helvetica", 16, "bold")).grid(
+            row=0, column=0, sticky="w", padx=16, pady=(16, 12)
+        )
+        tk.Label(
+            window,
+            text="Use this window to upload study files, define rename targets, and remove bad learning samples.",
+            anchor="w",
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
+
+        types_frame = tk.Frame(window)
+        types_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        types_frame.columnconfigure(0, weight=1)
+        types_frame.columnconfigure(1, weight=1)
+        types_frame.columnconfigure(2, weight=1)
+        types_frame.columnconfigure(3, weight=1)
+        types_frame.rowconfigure(0, weight=1)
+
+        self.types_listbox = tk.Listbox(types_frame, exportselection=False, height=10)
+        self.types_listbox.grid(row=0, column=0, rowspan=7, sticky="nsew", padx=(0, 8), pady=0)
+        self.types_listbox.bind("<<ListboxSelect>>", self.on_type_selection)
+
+        tk.Label(types_frame, text="Label").grid(row=0, column=1, sticky="w", padx=(8, 12), pady=(0, 4))
+        tk.Entry(types_frame, textvariable=self.type_label_var).grid(row=1, column=1, sticky="ew", padx=(8, 12))
+        tk.Label(types_frame, text="Code").grid(row=0, column=2, sticky="w", padx=(0, 12), pady=(0, 4))
+        tk.Entry(types_frame, textvariable=self.type_code_var).grid(row=1, column=2, sticky="ew", padx=(0, 12))
+        tk.Label(types_frame, text="Keywords").grid(row=2, column=1, sticky="w", padx=(8, 12), pady=(8, 4))
+        tk.Entry(types_frame, textvariable=self.type_keywords_var).grid(
+            row=3, column=1, columnspan=2, sticky="ew", padx=(8, 12)
+        )
+        tk.Button(types_frame, text="Add / update", command=self.add_or_update_document_type).grid(
+            row=4, column=1, sticky="ew", padx=(8, 12), pady=(8, 8)
+        )
+        tk.Button(types_frame, text="Delete", command=self.delete_document_type).grid(
+            row=4, column=2, sticky="ew", padx=(0, 12), pady=(8, 8)
+        )
+        tk.Button(types_frame, text="Learn files", command=self.learn_reference_document).grid(
+            row=5, column=1, columnspan=2, sticky="ew", padx=(8, 12), pady=(0, 8)
+        )
+
+        reference_frame = tk.LabelFrame(types_frame, text="Study elements")
+        reference_frame.grid(row=0, column=3, rowspan=7, sticky="nsew")
+        reference_frame.columnconfigure(0, weight=1)
+        reference_frame.rowconfigure(0, weight=1)
+        self.reference_listbox = tk.Listbox(reference_frame, exportselection=False, height=10)
+        self.reference_listbox.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 8))
+        self.reference_listbox.bind("<<ListboxSelect>>", self.on_reference_selection)
+        tk.Button(reference_frame, text="Delete study element", command=self.delete_reference_document).grid(
+            row=1, column=0, sticky="ew", padx=12, pady=(0, 8)
+        )
+        tk.Label(
+            reference_frame,
+            textvariable=self.reference_info_var,
+            anchor="w",
+            justify="left",
+            wraplength=220,
+        ).grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
+
+        window.protocol("WM_DELETE_WINDOW", self.close_learning_window)
+        self.refresh_document_type_widgets()
+
+    def close_learning_window(self):
+        if self.learning_window is not None and self.learning_window.winfo_exists():
+            self.learning_window.destroy()
+        self.learning_window = None
+        self.types_listbox = None
+        self.reference_listbox = None
 
     def prevent_log_edit(self, event):
         if (event.state & 0x4) and event.keysym.lower() in {"c", "a"}:
@@ -766,20 +1242,145 @@ class BatchRenamerApp:
     def known_codes(self) -> List[str]:
         return sorted(set(self.document_types.values()))
 
+    def reference_count_for_label(self, label: str) -> int:
+        return len(self.document_reference_samples.get(label, []))
+
+    def selected_reference_index(self) -> Optional[int]:
+        if self.reference_listbox is None:
+            return None
+        selection = self.reference_listbox.curselection()
+        if not selection:
+            return None
+        return selection[0]
+
+    def refresh_reference_list(self):
+        if self.reference_listbox is None:
+            return
+        label = self.document_type_var.get().strip()
+        samples = self.document_reference_samples.get(label, [])
+        self.reference_listbox.delete(0, "end")
+
+        for index, sample in enumerate(samples, start=1):
+            source_name = sample.get("name") or f"Sample {index}"
+            extraction_method = sample.get("extraction_method", "-")
+            rename_code = sample.get("rename_code", self.document_types.get(label, "-"))
+            self.reference_listbox.insert("end", f"{index}. {source_name} -> {rename_code} [{extraction_method}]")
+
+        if samples:
+            self.reference_listbox.selection_set(0)
+            self.reference_listbox.activate(0)
+            self.on_reference_selection()
+        else:
+            self.reference_info_var.set("No reference selected.")
+
+    def on_reference_selection(self, _event=None):
+        if self.reference_listbox is None:
+            return
+        label = self.document_type_var.get().strip()
+        samples = self.document_reference_samples.get(label, [])
+        index = self.selected_reference_index()
+        if index is None or index >= len(samples):
+            self.reference_info_var.set("No reference selected.")
+            return
+
+        sample = samples[index]
+        self.reference_info_var.set(
+            f"File: {sample.get('name', '-')}\n"
+            f"Rename name: {sample.get('rename_label', label)}\n"
+            f"Rename code: {sample.get('rename_code', self.document_types.get(label, '-'))}\n"
+            f"Source: {sample.get('source', '-')}\n"
+            f"Terms: {len(sample.get('terms', []))}\n"
+            f"Phrases: {len(sample.get('phrases', []))}\n"
+            f"Lines: {len(sample.get('lines', []))}"
+        )
+
+    def save_document_config(self):
+        try:
+            ai_review_threshold = float(self.ai_review_threshold_var.get().strip())
+            ai_auto_threshold = float(self.ai_auto_threshold_var.get().strip())
+        except ValueError as exc:
+            raise ValueError("AI thresholds must be numeric values.") from exc
+
+        if not 0 <= ai_review_threshold <= 1 or not 0 <= ai_auto_threshold <= 1:
+            raise ValueError("AI thresholds must be between 0 and 1.")
+        if ai_auto_threshold < ai_review_threshold:
+            raise ValueError("AI auto threshold must be greater than or equal to AI review threshold.")
+
+        self.config["document_types"] = self.document_types
+        self.config["document_keywords"] = self.document_keywords
+        self.config["document_reference_samples"] = self.document_reference_samples
+        self.config["auto_rename"] = self.auto_rename_var.get()
+        self.config["ai_agent_enabled"] = self.ai_agent_var.get()
+        self.config["ai_review_threshold"] = ai_review_threshold
+        self.config["ai_auto_rename_threshold"] = ai_auto_threshold
+        self.config["openai_api_key"] = self.api_key_var.get().strip()
+        self.config["openai_model"] = self.api_model_var.get().strip() or DEFAULT_OPENAI_MODEL
+        self.config["openai_responses_url"] = self.api_url_var.get().strip() or DEFAULT_OPENAI_RESPONSES_URL
+        save_config(self.config)
+
+    def prompt_reference_target(self) -> Optional[Tuple[str, str]]:
+        default_label = self.document_type_var.get().strip() or self.type_label_var.get().strip() or "Document"
+        rename_label = simpledialog.askstring(
+            "Rename name",
+            "Enter the rename name for this model:",
+            parent=self.root,
+            initialvalue=default_label,
+        )
+        if rename_label is None:
+            return None
+
+        rename_label = rename_label.strip()
+        if not rename_label:
+            messagebox.showerror("Reference learning error", "The rename name cannot be empty.")
+            return None
+
+        default_code = self.document_types.get(rename_label, self.type_code_var.get().strip() or DEFAULT_CODE)
+        rename_code_raw = simpledialog.askstring(
+            "Rename code",
+            "Enter the rename code for this model:",
+            parent=self.root,
+            initialvalue=default_code,
+        )
+        if rename_code_raw is None:
+            return None
+
+        try:
+            rename_code = normalize_code(rename_code_raw)
+        except Exception as exc:
+            messagebox.showerror("Reference learning error", str(exc))
+            return None
+
+        return rename_label, rename_code
+
     def save_settings(self):
         try:
             folder = self.current_settings()
+            self.config["default_folder"] = str(folder)
+            self.save_document_config()
         except Exception as exc:
             messagebox.showerror("Invalid settings", str(exc))
             return
 
-        self.config["default_folder"] = str(folder)
-        self.config["document_types"] = self.document_types
-        self.config["document_keywords"] = self.document_keywords
-        self.config["auto_rename"] = self.auto_rename_var.get()
-        save_config(self.config)
         self.status_var.set(f"Settings saved for {folder}")
         self.log(f"Saved folder: {folder}")
+
+    def ai_thresholds(self) -> Tuple[float, float]:
+        try:
+            review_threshold = float(self.ai_review_threshold_var.get().strip())
+            auto_threshold = float(self.ai_auto_threshold_var.get().strip())
+        except ValueError:
+            return DEFAULT_AI_REVIEW_THRESHOLD, DEFAULT_AI_AUTO_RENAME_THRESHOLD
+        return review_threshold, auto_threshold
+
+    def use_ai_agent(self) -> bool:
+        return self.ai_agent_var.get() and bool(self.api_key_var.get().strip())
+
+    def api_settings(self) -> Tuple[str, str, str]:
+        return (
+            self.api_key_var.get().strip(),
+            self.api_model_var.get().strip() or DEFAULT_OPENAI_MODEL,
+            self.api_url_var.get().strip() or DEFAULT_OPENAI_RESPONSES_URL,
+        )
 
     def select_folder(self):
         selected = filedialog.askdirectory(
@@ -842,9 +1443,14 @@ class BatchRenamerApp:
 
     def refresh_document_type_widgets(self):
         labels = list(self.document_types.keys())
-        self.types_listbox.delete(0, "end")
-        for label in labels:
-            self.types_listbox.insert("end", f"{label} -> {self.document_types[label]}")
+        if self.types_listbox is not None:
+            self.types_listbox.delete(0, "end")
+            for label in labels:
+                reference_count = self.reference_count_for_label(label)
+                self.types_listbox.insert(
+                    "end",
+                    f"{label} -> {self.document_types[label]} [{reference_count} ref]",
+                )
 
         self.document_type_combo["values"] = labels
         if labels:
@@ -855,8 +1461,15 @@ class BatchRenamerApp:
                 self.type_label_var.set(self.document_type_var.get())
                 self.type_code_var.set(self.document_types[self.document_type_var.get()])
                 self.type_keywords_var.set(", ".join(self.document_keywords.get(self.document_type_var.get(), [])))
+            self.refresh_reference_list()
+        else:
+            if self.reference_listbox is not None:
+                self.reference_listbox.delete(0, "end")
+            self.reference_info_var.set("No reference selected.")
 
     def on_type_selection(self, _event=None):
+        if self.types_listbox is None:
+            return
         selection = self.types_listbox.curselection()
         if not selection:
             return
@@ -866,6 +1479,7 @@ class BatchRenamerApp:
         self.type_code_var.set(self.document_types[label])
         self.type_keywords_var.set(", ".join(self.document_keywords.get(label, [])))
         self.document_type_var.set(label)
+        self.refresh_reference_list()
 
     def add_or_update_document_type(self):
         label = self.type_label_var.get().strip()
@@ -884,10 +1498,9 @@ class BatchRenamerApp:
         keywords = [keyword.strip().lower() for keyword in self.type_keywords_var.get().split(",") if keyword.strip()]
         self.document_types[label] = code
         self.document_keywords[label] = keywords
+        self.document_reference_samples.setdefault(label, [])
         self.refresh_document_type_widgets()
-        self.config["document_types"] = self.document_types
-        self.config["document_keywords"] = self.document_keywords
-        save_config(self.config)
+        self.save_document_config()
         try:
             folder = self.current_settings()
         except Exception:
@@ -909,6 +1522,7 @@ class BatchRenamerApp:
         label = list(self.document_types.keys())[selection[0]]
         self.document_types.pop(label, None)
         self.document_keywords.pop(label, None)
+        self.document_reference_samples.pop(label, None)
 
         keys_to_remove = [
             key for key, assigned_label in self.pending_assignments.items() if assigned_label == label
@@ -920,9 +1534,7 @@ class BatchRenamerApp:
         self.type_code_var.set("")
         self.type_keywords_var.set("")
         self.refresh_document_type_widgets()
-        self.config["document_types"] = self.document_types
-        self.config["document_keywords"] = self.document_keywords
-        save_config(self.config)
+        self.save_document_config()
         self.assignment_info_var.set("Select a file to classify.")
         try:
             folder = self.current_settings()
@@ -932,6 +1544,101 @@ class BatchRenamerApp:
             self.refresh_pending_list(folder)
             self.set_preview(build_existing_files_preview(folder, self.known_codes()))
         self.status_var.set(f"Deleted document type: {label}")
+
+    def learn_reference_document(self):
+        reference_target = self.prompt_reference_target()
+        if reference_target is None:
+            return
+        label, code = reference_target
+
+        try:
+            initial_dir = self.folder_var.get() or str(Path.home())
+            selected = filedialog.askopenfilenames(
+                title=f"Select one or more reference files for {label}",
+                initialdir=initial_dir,
+            )
+        except Exception as exc:
+            messagebox.showerror("Reference learning error", str(exc))
+            return
+
+        if not selected:
+            return
+
+        self.document_types[label] = code
+        self.document_keywords.setdefault(label, [])
+        existing_samples = self.document_reference_samples.setdefault(label, [])
+        learned_count = 0
+
+        for selected_path in selected:
+            file_path = Path(selected_path).expanduser()
+            if not file_path.exists() or not file_path.is_file():
+                self.log(f"Skipped missing reference file: {file_path}")
+                continue
+
+            extracted_text, extraction_method = extract_text_preview(file_path)
+            if not extracted_text.strip():
+                self.log(f"Skipped unreadable reference file: {file_path.name}")
+                continue
+
+            sample = build_reference_sample(file_path, extracted_text, extraction_method, label, code)
+            existing_samples = [
+                current_sample for current_sample in existing_samples if current_sample.get("source") != str(file_path)
+            ]
+            existing_samples.append(sample)
+            learned_count += 1
+
+        self.document_reference_samples[label] = existing_samples
+
+        if learned_count == 0:
+            messagebox.showerror(
+                "Reference learning error",
+                "No readable file was learned from the selected files.",
+            )
+            return
+
+        self.save_document_config()
+        self.refresh_document_type_widgets()
+        self.type_label_var.set(label)
+        self.type_code_var.set(code)
+        self.type_keywords_var.set(", ".join(self.document_keywords.get(label, [])))
+        self.document_type_var.set(label)
+        self.refresh_reference_list()
+        self.status_var.set(f"Learned {learned_count} reference file(s) for {label} ({code})")
+        self.log(
+            f"Learned {learned_count} reference file(s) for {label} ({code})."
+        )
+
+    def delete_reference_document(self):
+        label = self.document_type_var.get().strip()
+        if label not in self.document_types:
+            messagebox.showerror("Reference deletion error", "Select a valid document type first.")
+            return
+
+        index = self.selected_reference_index()
+        samples = self.document_reference_samples.get(label, [])
+        if index is None or index >= len(samples):
+            messagebox.showerror("Reference deletion error", "Select a reference sample to delete.")
+            return
+
+        removed_sample = samples.pop(index)
+        confirm = messagebox.askyesno(
+            "Delete study element",
+            (
+                f"Delete the study element '{removed_sample.get('name', '-')}' "
+                f"for rename target {label} ({self.document_types.get(label, '-')})?"
+            ),
+        )
+        if not confirm:
+            samples.insert(index, removed_sample)
+            return
+
+        self.document_reference_samples[label] = samples
+        self.save_document_config()
+        self.refresh_document_type_widgets()
+        self.document_type_var.set(label)
+        self.refresh_reference_list()
+        self.status_var.set(f"Deleted reference for {label}: {removed_sample.get('name', '-')}")
+        self.log(f"Deleted reference sample {removed_sample.get('name', '-')} from {label}.")
 
     def refresh_pending_list(self, folder: Path):
         current_selection = self.selected_pending_file()
@@ -1023,6 +1730,7 @@ class BatchRenamerApp:
         self.assignment_info_var.set(
             f"Selected: {selected_file.name}\n"
             f"Code: {code}\n"
+            f"References: {self.reference_count_for_label(self.document_type_var.get())}\n"
             f"New name preview: {code}_NNN{selected_file.suffix.lower()}\n"
             f"Text source: {extraction_method}\n"
             f"Extracted text: {preview_text}"
@@ -1100,14 +1808,89 @@ class BatchRenamerApp:
     def auto_detect_ready_files(self, folder: Path, ready_files: Sequence[Path]):
         auto_assignments: Dict[str, str] = {}
         detected_count = 0
+        review_threshold, auto_threshold = self.ai_thresholds()
 
         for file_path in ready_files:
-            label, score, matches, detection_status = detect_document_type(
-                file_path,
-                self.document_types,
-                self.document_keywords,
-            )
             key = str(file_path)
+            if self.use_ai_agent():
+                extracted_text, extraction_method = extract_text_preview(file_path)
+                if not extracted_text.strip():
+                    self.set_pending_detection_status(
+                        key,
+                        "No text",
+                        f"No readable text found in {file_path.name}. OCR could not be applied.",
+                    )
+                    continue
+
+                try:
+                    api_key, api_model, api_url = self.api_settings()
+                    decision = ask_ai_agent_to_classify(
+                        file_path,
+                        extracted_text,
+                        extraction_method,
+                        self.document_types,
+                        self.document_keywords,
+                        self.document_reference_samples,
+                        api_key,
+                        api_model,
+                        api_url,
+                    )
+                except Exception as exc:
+                    self.set_pending_detection_status(
+                        key,
+                        "AI error",
+                        f"AI agent failed for {file_path.name}. Falling back to local detection: {exc}",
+                    )
+                    label, score, matches, detection_status = detect_document_type(
+                        file_path,
+                        self.document_types,
+                        self.document_keywords,
+                        self.document_reference_samples,
+                    )
+                else:
+                    label = decision.get("rename_label")
+                    confidence = float(decision.get("confidence", 0))
+                    matches = list(decision.get("matched_evidence", []))
+                    action = decision.get("action", "review")
+                    detection_status = action
+
+                    if action == "auto_rename" and label in self.document_types and confidence >= auto_threshold:
+                        auto_assignments[key] = label
+                        self.pending_statuses[key] = "AI auto"
+                        self.logged_detection_statuses.pop(key, None)
+                        detected_count += 1
+                        self.log(
+                            f"AI auto-detected {file_path.name} as {label} ({self.document_types[label]}) at {confidence:.2f} confidence."
+                        )
+                        continue
+
+                    if action in {"auto_rename", "review"} and label in self.document_types and confidence >= review_threshold:
+                        self.pending_assignments[key] = label
+                        self.set_pending_detection_status(
+                            key,
+                            "AI review",
+                            (
+                                f"AI suggests {label} ({self.document_types[label]}) for {file_path.name} "
+                                f"at {confidence:.2f} confidence. Review before renaming."
+                            ),
+                        )
+                        continue
+
+                    self.set_pending_detection_status(
+                        key,
+                        "AI rejected",
+                        f"AI agent could not confidently classify {file_path.name}: {decision.get('reason', 'No reason provided.')}",
+                    )
+                    continue
+
+            else:
+                label, score, matches, detection_status = detect_document_type(
+                    file_path,
+                    self.document_types,
+                    self.document_keywords,
+                    self.document_reference_samples,
+                )
+
             if label is None:
                 if detection_status == "ocr_missing":
                     self.set_pending_detection_status(
