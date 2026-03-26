@@ -465,6 +465,18 @@ def detect_document_type(
     return best_label, best_score, best_matches, extraction_method
 
 
+def extract_text_preview(file_path: Path) -> Tuple[str, str]:
+    raw_text, extraction_method = extract_text_for_detection(file_path)
+    text = raw_text.strip()
+    suffix = file_path.suffix.lower()
+
+    if not text and suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".pdf"}:
+        raw_text, extraction_method = extract_text_with_ocr(file_path)
+        text = raw_text.strip()
+
+    return text, extraction_method
+
+
 class BatchRenamerApp:
     def __init__(self, root):
         self.root = root
@@ -484,6 +496,8 @@ class BatchRenamerApp:
         self.activity_logs: List[str] = []
         self.pending_assignments: Dict[str, str] = {}
         self.pending_statuses: Dict[str, str] = {}
+        self.logged_detection_statuses: Dict[str, str] = {}
+        self.extracted_text_cache: Dict[str, Tuple[str, str]] = {}
         self.pending_paths: List[Path] = []
 
         self.folder_var = tk.StringVar(value=self.config.get("default_folder", ""))
@@ -596,6 +610,7 @@ class BatchRenamerApp:
         classification_frame.grid(row=6, column=0, columnspan=3, sticky="nsew", padx=16, pady=(0, 8))
         classification_frame.columnconfigure(0, weight=1)
         classification_frame.columnconfigure(1, weight=0)
+        classification_frame.columnconfigure(2, weight=1)
         classification_frame.rowconfigure(1, weight=1)
 
         queue_label = tk.Label(classification_frame, text="New files waiting for a document code")
@@ -652,6 +667,22 @@ class BatchRenamerApp:
         )
         assignment_info_label.grid(row=4, column=0, sticky="ew")
 
+        extracted_text_frame = tk.Frame(classification_frame)
+        extracted_text_frame.grid(row=1, column=2, sticky="nsew", padx=(0, 12), pady=(0, 12))
+        extracted_text_frame.columnconfigure(0, weight=1)
+        extracted_text_frame.rowconfigure(1, weight=1)
+
+        extracted_text_label = tk.Label(extracted_text_frame, text="Extracted text")
+        extracted_text_label.grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        self.extracted_text_widget = scrolledtext.ScrolledText(
+            extracted_text_frame,
+            height=8,
+            wrap="word",
+            state="disabled",
+        )
+        self.extracted_text_widget.grid(row=1, column=0, sticky="nsew")
+
         controls = tk.Frame(self.root)
         controls.grid(row=7, column=0, columnspan=3, sticky="nsew", padx=16, pady=(0, 16))
         controls.columnconfigure(0, weight=1)
@@ -687,6 +718,18 @@ class BatchRenamerApp:
     def set_preview(self, lines: Sequence[str]):
         self.preview_files = {str(index): line for index, line in enumerate(lines)}
         self.render_monitoring_output()
+
+    def set_pending_detection_status(self, key: str, status: str, message: str):
+        self.pending_statuses[key] = status
+        if self.logged_detection_statuses.get(key) != status:
+            self.logged_detection_statuses[key] = status
+            self.log(message)
+
+    def show_extracted_text(self, text: str):
+        self.extracted_text_widget.configure(state="normal")
+        self.extracted_text_widget.delete("1.0", "end")
+        self.extracted_text_widget.insert("1.0", text)
+        self.extracted_text_widget.configure(state="disabled")
 
     def prevent_log_edit(self, event):
         if (event.state & 0x4) and event.keysym.lower() in {"c", "a"}:
@@ -906,6 +949,12 @@ class BatchRenamerApp:
 
         self.pending_assignments = filtered_assignments
         self.pending_statuses = filtered_statuses
+        self.logged_detection_statuses = {
+            key: status for key, status in self.logged_detection_statuses.items() if key in filtered_statuses
+        }
+        self.extracted_text_cache = {
+            key: value for key, value in self.extracted_text_cache.items() if key in filtered_statuses
+        }
         self.pending_paths = pending_files
 
         self.pending_listbox.delete(0, "end")
@@ -923,6 +972,7 @@ class BatchRenamerApp:
                 )
             except StopIteration:
                 self.assignment_info_var.set("Select a file to classify.")
+                self.show_extracted_text("No file selected.")
             else:
                 self.pending_listbox.selection_set(new_index)
                 self.pending_listbox.activate(new_index)
@@ -935,6 +985,7 @@ class BatchRenamerApp:
             self.on_pending_selection()
         else:
             self.assignment_info_var.set("No unclassified files detected.")
+            self.show_extracted_text("No file selected.")
 
     def selected_pending_file(self) -> Optional[Path]:
         selection = self.pending_listbox.curselection()
@@ -946,6 +997,7 @@ class BatchRenamerApp:
         selected_file = self.selected_pending_file()
         if selected_file is None:
             self.assignment_info_var.set("Select a file to classify.")
+            self.show_extracted_text("No file selected.")
             return
 
         assigned_label = self.pending_assignments.get(str(selected_file))
@@ -955,9 +1007,30 @@ class BatchRenamerApp:
             self.document_type_var.set(next(iter(self.document_types)))
 
         code = self.document_types[self.document_type_var.get()]
+        cache_key = str(selected_file)
+        extracted_text, extraction_method = self.extracted_text_cache.get(cache_key, ("", "unreadable"))
+        if cache_key not in self.extracted_text_cache:
+            extracted_text, extraction_method = extract_text_preview(selected_file)
+            self.extracted_text_cache[cache_key] = (extracted_text, extraction_method)
+
+        preview_text = "No text extracted."
+        if extracted_text:
+            collapsed_text = re.sub(r"\s+", " ", extracted_text).strip()
+            preview_text = collapsed_text[:220]
+            if len(collapsed_text) > 220:
+                preview_text += "..."
+
         self.assignment_info_var.set(
-            f"Selected: {selected_file.name}\nCode: {code}\nNew name preview: {code}_NNN{selected_file.suffix.lower()}"
+            f"Selected: {selected_file.name}\n"
+            f"Code: {code}\n"
+            f"New name preview: {code}_NNN{selected_file.suffix.lower()}\n"
+            f"Text source: {extraction_method}\n"
+            f"Extracted text: {preview_text}"
         )
+        if extracted_text:
+            self.show_extracted_text(extracted_text)
+        else:
+            self.show_extracted_text(f"No text extracted.\nSource: {extraction_method}")
 
     def assign_selected_document_type(self):
         selected_file = self.selected_pending_file()
@@ -1017,6 +1090,7 @@ class BatchRenamerApp:
             key = str(file_path)
             self.pending_assignments.pop(key, None)
             self.pending_statuses.pop(key, None)
+            self.extracted_text_cache.pop(key, None)
             self.file_sizes.pop(f"file:{file_path}", None)
 
         self.refresh_pending_list(folder)
@@ -1036,27 +1110,46 @@ class BatchRenamerApp:
             key = str(file_path)
             if label is None:
                 if detection_status == "ocr_missing":
-                    self.pending_statuses[key] = "OCR missing"
-                    self.log(f"OCR not available for {file_path.name}. Install tesseract to read scanned images.")
+                    self.set_pending_detection_status(
+                        key,
+                        "OCR missing",
+                        f"OCR not available for {file_path.name}. Install tesseract to read scanned images.",
+                    )
                 elif detection_status == "ocr_failed":
-                    self.pending_statuses[key] = "OCR failed"
-                    self.log(f"OCR could not read {file_path.name}. Verify the file format and tesseract installation.")
+                    self.set_pending_detection_status(
+                        key,
+                        "OCR failed",
+                        f"OCR could not read {file_path.name}. Verify the file format and tesseract installation.",
+                    )
                 elif detection_status.startswith("no_text_extracted"):
-                    self.pending_statuses[key] = "No text"
-                    self.log(f"No readable text found in {file_path.name}. OCR could not be applied.")
+                    self.set_pending_detection_status(
+                        key,
+                        "No text",
+                        f"No readable text found in {file_path.name}. OCR could not be applied.",
+                    )
                 elif detection_status == "ambiguous_match":
-                    self.pending_statuses[key] = "Ambiguous"
-                    self.log(f"Ambiguous detection for {file_path.name}. Multiple document types scored similarly.")
+                    self.set_pending_detection_status(
+                        key,
+                        "Ambiguous",
+                        f"Ambiguous detection for {file_path.name}. Multiple document types scored similarly.",
+                    )
                 elif detection_status == "low_confidence":
-                    self.pending_statuses[key] = "Low confidence"
-                    self.log(f"Low-confidence detection for {file_path.name}. Add stronger keywords or review manually.")
+                    self.set_pending_detection_status(
+                        key,
+                        "Low confidence",
+                        f"Low-confidence detection for {file_path.name}. Add stronger keywords or review manually.",
+                    )
                 else:
-                    self.pending_statuses[key] = "Review"
-                    self.log(f"No keyword match found for {file_path.name}. Check the configured keywords.")
+                    self.set_pending_detection_status(
+                        key,
+                        "Review",
+                        f"No keyword match found for {file_path.name}. Check the configured keywords.",
+                    )
                 continue
 
             auto_assignments[key] = label
             self.pending_statuses[key] = "Auto"
+            self.logged_detection_statuses.pop(key, None)
             detected_count += 1
             self.log(
                 f"Auto-detected {file_path.name} as {label} ({self.document_types[label]}) using: {', '.join(matches[:3])}"
@@ -1077,6 +1170,8 @@ class BatchRenamerApp:
             key = str(file_path)
             self.pending_assignments.pop(key, None)
             self.pending_statuses.pop(key, None)
+            self.logged_detection_statuses.pop(key, None)
+            self.extracted_text_cache.pop(key, None)
             self.file_sizes.pop(f"file:{file_path}", None)
 
         return detected_count
@@ -1107,8 +1202,11 @@ class BatchRenamerApp:
         self.file_sizes.clear()
         self.preview_files.clear()
         self.pending_statuses.clear()
+        self.logged_detection_statuses.clear()
+        self.extracted_text_cache.clear()
         self.pending_paths.clear()
         self.pending_listbox.delete(0, "end")
+        self.show_extracted_text("Monitoring stopped.")
         if self.monitor_after_id is not None:
             self.root.after_cancel(self.monitor_after_id)
             self.monitor_after_id = None
