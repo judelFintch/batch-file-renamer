@@ -72,6 +72,8 @@ When a file appears:
 
 This prevents renaming a file while the scanner is still writing it.
 
+For scanned images and image-only PDFs, the app will try OCR through `tesseract` when no embedded text is available.
+
 ## Naming Format
 
 The app renames files like this:
@@ -179,4 +181,6 @@ Options:
 - Python 3
 - `tkinter` available in your Python installation
 
-No external dependency is required.
+Optional for scanned images and image-only PDFs:
+
+- `tesseract`

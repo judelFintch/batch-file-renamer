@@ -383,6 +383,26 @@ def ocr_is_available() -> bool:
     return shutil.which("tesseract") is not None
 
 
+def extract_text_with_ocr(file_path: Path) -> Tuple[str, str]:
+    if not ocr_is_available():
+        return "", "ocr_missing"
+
+    try:
+        ocr_result = subprocess.run(
+            ["tesseract", str(file_path), "stdout"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return "", "ocr_failed"
+
+    if ocr_result.returncode != 0:
+        return "", "ocr_failed"
+
+    return ocr_result.stdout, "ocr"
+
+
 def detect_document_type(
     file_path: Path,
     document_types: Dict[str, str],
@@ -390,12 +410,16 @@ def detect_document_type(
 ) -> Tuple[Optional[str], int, List[str], str]:
     raw_text, extraction_method = extract_text_for_detection(file_path)
     text = normalize_text_for_matching(raw_text)
+    suffix = file_path.suffix.lower()
+
+    if not text.strip() and suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".pdf"}:
+        raw_text, extraction_method = extract_text_with_ocr(file_path)
+        text = normalize_text_for_matching(raw_text)
+        if not text.strip():
+            return None, 0, [], extraction_method
+
     if not text.strip():
-        if file_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"} and not ocr_is_available():
-            return None, 0, [], "ocr_missing"
-        if file_path.suffix.lower() == ".pdf" and not ocr_is_available():
-            return None, 0, [], f"no_text_extracted:{extraction_method}"
-        return None, 0, [], "no_text_extracted"
+        return None, 0, [], f"no_text_extracted:{extraction_method}"
 
     best_label = None
     best_score = 0
@@ -648,8 +672,9 @@ class BatchRenamerApp:
         )
         status_label.grid(row=0, column=0, sticky="ew", padx=(140, 0), pady=(0, 8))
 
-        self.log_text = scrolledtext.ScrolledText(controls, state="disabled", wrap="word")
+        self.log_text = scrolledtext.ScrolledText(controls, wrap="word")
         self.log_text.grid(row=1, column=0, sticky="nsew")
+        self.log_text.bind("<Key>", self.prevent_log_edit)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_document_type_widgets()
@@ -662,6 +687,13 @@ class BatchRenamerApp:
     def set_preview(self, lines: Sequence[str]):
         self.preview_files = {str(index): line for index, line in enumerate(lines)}
         self.render_monitoring_output()
+
+    def prevent_log_edit(self, event):
+        if (event.state & 0x4) and event.keysym.lower() in {"c", "a"}:
+            return None
+        if event.keysym in {"Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next"}:
+            return None
+        return "break"
 
     def render_monitoring_output(self):
         sections = ["FILES PRESENTS"]
@@ -679,11 +711,9 @@ class BatchRenamerApp:
         else:
             sections.append("Aucun evenement pour le moment.")
 
-        self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.insert("end", "\n".join(sections))
         self.log_text.see("1.0")
-        self.log_text.configure(state="disabled")
 
     def current_settings(self) -> Path:
         folder = Path(self.folder_var.get()).expanduser()
@@ -1008,6 +1038,9 @@ class BatchRenamerApp:
                 if detection_status == "ocr_missing":
                     self.pending_statuses[key] = "OCR missing"
                     self.log(f"OCR not available for {file_path.name}. Install tesseract to read scanned images.")
+                elif detection_status == "ocr_failed":
+                    self.pending_statuses[key] = "OCR failed"
+                    self.log(f"OCR could not read {file_path.name}. Verify the file format and tesseract installation.")
                 elif detection_status.startswith("no_text_extracted"):
                     self.pending_statuses[key] = "No text"
                     self.log(f"No readable text found in {file_path.name}. OCR could not be applied.")
