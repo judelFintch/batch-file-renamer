@@ -193,4 +193,4 @@ Optional for scanned images and image-only PDFs:
 Optional for the AI agent workflow:
 
 - `OPENAI_API_KEY`
-- `OPENAI_MODEL` to override the default model (`gpt-4o-mini`)
+- `OPENAI_MODEL` to override the default model (`gpt-5.4`)

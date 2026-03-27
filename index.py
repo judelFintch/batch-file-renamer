@@ -43,7 +43,7 @@ DEFAULT_AUTO_RENAME = True
 DEFAULT_AI_AGENT_ENABLED = False
 DEFAULT_AI_REVIEW_THRESHOLD = 0.65
 DEFAULT_AI_AUTO_RENAME_THRESHOLD = 0.85
-DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_OPENAI_MODEL = "gpt-5.4"
 DEFAULT_OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 AUTO_DETECT_MIN_SCORE = 2
 AUTO_DETECT_MIN_MARGIN = 1
@@ -420,7 +420,9 @@ def ask_ai_agent_to_classify(
                 "content": json.dumps(prompt_payload, ensure_ascii=True),
             },
         ],
+        "reasoning": {"effort": "high"},
         "text": {
+            "verbosity": "low",
             "format": {
                 "type": "json_schema",
                 "name": "document_routing_decision",
@@ -1411,6 +1413,8 @@ class BatchRenamerApp:
         request_body = {
             "model": api_model,
             "input": "Return the word successful.",
+            "reasoning": {"effort": "none"},
+            "text": {"verbosity": "low"},
             "max_output_tokens": 16,
         }
 
