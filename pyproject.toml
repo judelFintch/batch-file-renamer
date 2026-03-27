@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "batch-file-renamer"
+version = "0.1.0"
+description = "Desktop tool to monitor scan folders, classify documents, and rename files."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Batch File Renamer" }
+]
+dependencies = []
+
+[project.scripts]
+batch-file-renamer = "batch_renamer.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["index"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
