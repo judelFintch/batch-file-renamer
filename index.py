@@ -45,6 +45,11 @@ DEFAULT_AI_REVIEW_THRESHOLD = 0.65
 DEFAULT_AI_AUTO_RENAME_THRESHOLD = 0.85
 DEFAULT_OPENAI_MODEL = "gpt-5.4"
 DEFAULT_OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+DEFAULT_AI_PROVIDER = "openai"
+DEFAULT_OLLAMA_MODEL = "llama3.2:3b"
+DEFAULT_OLLAMA_URL = "http://localhost:11434/api/generate"
+DEFAULT_LMSTUDIO_MODEL = "local-model"
+DEFAULT_LMSTUDIO_URL = "http://localhost:1234/v1/responses"
 AUTO_DETECT_MIN_SCORE = 2
 AUTO_DETECT_MIN_MARGIN = 1
 REFERENCE_TERM_LIMIT = 24
@@ -355,6 +360,35 @@ def send_openai_responses_request(
     return json.loads(raw_response)
 
 
+def send_json_post_request(
+    endpoint_url: str,
+    request_body: Dict[str, Any],
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 45,
+) -> Dict[str, Any]:
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
+
+    request = urllib.request.Request(
+        endpoint_url,
+        data=json.dumps(request_body).encode("utf-8"),
+        headers=request_headers,
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw_response = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Request failed: {exc.code} {error_body}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Request failed: {exc.reason}") from exc
+
+    return json.loads(raw_response)
+
+
 def ask_ai_agent_to_classify(
     file_path: Path,
     extracted_text: str,
@@ -441,6 +475,160 @@ def ask_ai_agent_to_classify(
     if decision.get("rename_label") and decision["rename_label"] not in document_types:
         decision["action"] = "review"
         decision["reason"] = "AI proposed an unknown rename target."
+    return decision
+
+
+def ask_ollama_agent_to_classify(
+    file_path: Path,
+    extracted_text: str,
+    extraction_method: str,
+    document_types: Dict[str, str],
+    document_keywords: Dict[str, Sequence[str]],
+    document_reference_samples: Dict[str, Sequence[Dict[str, Any]]],
+    model: str,
+    endpoint_url: str,
+) -> Dict[str, Any]:
+    prompt_payload = {
+        "filename": file_path.name,
+        "suffix": file_path.suffix.lower(),
+        "extraction_method": extraction_method,
+        "document_targets": build_reference_summary_for_prompt(
+            document_types,
+            document_keywords,
+            document_reference_samples,
+        ),
+        "document_text": extracted_text[:12000],
+        "expected_json_keys": [
+            "action",
+            "rename_label",
+            "rename_code",
+            "confidence",
+            "reason",
+            "matched_evidence",
+        ],
+    }
+
+    prompt = (
+        "You are a document-routing agent. "
+        "Choose only among the provided rename targets. "
+        "Return JSON only with keys: "
+        "action, rename_label, rename_code, confidence, reason, matched_evidence. "
+        "action must be auto_rename, review, or reject. "
+        "confidence must be between 0 and 1.\n\n"
+        f"{json.dumps(prompt_payload, ensure_ascii=True)}"
+    )
+
+    request_body = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "format": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "rename_label": {"type": ["string", "null"]},
+                "rename_code": {"type": ["string", "null"]},
+                "confidence": {"type": "number"},
+                "reason": {"type": "string"},
+                "matched_evidence": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["action", "rename_label", "rename_code", "confidence", "reason", "matched_evidence"],
+        },
+    }
+
+    response_payload = send_json_post_request(endpoint_url, request_body)
+    response_text = str(response_payload.get("response", "")).strip()
+    if not response_text:
+        raise RuntimeError("Local agent returned an empty response.")
+
+    decision = json.loads(response_text)
+    if decision.get("rename_label") and decision["rename_label"] not in document_types:
+        decision["action"] = "review"
+        decision["reason"] = "Local agent proposed an unknown rename target."
+    return decision
+
+
+def ask_lmstudio_agent_to_classify(
+    file_path: Path,
+    extracted_text: str,
+    extraction_method: str,
+    document_types: Dict[str, str],
+    document_keywords: Dict[str, Sequence[str]],
+    document_reference_samples: Dict[str, Sequence[Dict[str, Any]]],
+    model: str,
+    endpoint_url: str,
+) -> Dict[str, Any]:
+    prompt_payload = {
+        "filename": file_path.name,
+        "suffix": file_path.suffix.lower(),
+        "extraction_method": extraction_method,
+        "document_targets": build_reference_summary_for_prompt(
+            document_types,
+            document_keywords,
+            document_reference_samples,
+        ),
+        "document_text": extracted_text[:12000],
+    }
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["auto_rename", "review", "reject"],
+            },
+            "rename_label": {"type": ["string", "null"]},
+            "rename_code": {"type": ["string", "null"]},
+            "confidence": {"type": "number"},
+            "reason": {"type": "string"},
+            "matched_evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["action", "rename_label", "rename_code", "confidence", "reason", "matched_evidence"],
+        "additionalProperties": False,
+    }
+
+    request_body = {
+        "model": model,
+        "input": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a document-routing agent. "
+                    "Choose only among the provided rename targets. "
+                    "Use action='auto_rename' only when evidence is strong. "
+                    "Use action='review' when there is some signal but a human should confirm. "
+                    "Use action='reject' when the document does not fit any known target. "
+                    "Confidence must be between 0 and 1."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(prompt_payload, ensure_ascii=True),
+            },
+        ],
+        "text": {
+            "verbosity": "low",
+            "format": {
+                "type": "json_schema",
+                "name": "document_routing_decision",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+    }
+
+    response_payload = send_json_post_request(endpoint_url, request_body)
+    response_text = extract_response_text(response_payload).strip()
+    if not response_text:
+        raise RuntimeError("LM Studio agent returned an empty response.")
+
+    decision = json.loads(response_text)
+    if decision.get("rename_label") and decision["rename_label"] not in document_types:
+        decision["action"] = "review"
+        decision["reason"] = "LM Studio agent proposed an unknown rename target."
     return decision
 
 
@@ -867,9 +1055,14 @@ class BatchRenamerApp:
         self.ai_auto_threshold_var = tk.StringVar(
             value=str(self.config.get("ai_auto_rename_threshold", DEFAULT_AI_AUTO_RENAME_THRESHOLD))
         )
+        self.ai_provider_var = tk.StringVar(value=self.config.get("ai_provider", DEFAULT_AI_PROVIDER))
         self.api_key_var = tk.StringVar(value=self.config.get("openai_api_key", os.environ.get("OPENAI_API_KEY", "")))
         self.api_model_var = tk.StringVar(value=self.config.get("openai_model", DEFAULT_OPENAI_MODEL))
         self.api_url_var = tk.StringVar(value=self.config.get("openai_responses_url", DEFAULT_OPENAI_RESPONSES_URL))
+        self.ollama_model_var = tk.StringVar(value=self.config.get("ollama_model", DEFAULT_OLLAMA_MODEL))
+        self.ollama_url_var = tk.StringVar(value=self.config.get("ollama_url", DEFAULT_OLLAMA_URL))
+        self.lmstudio_model_var = tk.StringVar(value=self.config.get("lmstudio_model", DEFAULT_LMSTUDIO_MODEL))
+        self.lmstudio_url_var = tk.StringVar(value=self.config.get("lmstudio_url", DEFAULT_LMSTUDIO_URL))
         self.api_test_status_var = tk.StringVar(value="API status: not tested")
         self.assignment_info_var = tk.StringVar(value="Select a file to classify.")
         self.reference_info_var = tk.StringVar(value="No reference selected.")
@@ -1083,6 +1276,15 @@ class BatchRenamerApp:
         tk.Checkbutton(window, text="Use AI agent workflow", variable=self.ai_agent_var).grid(
             row=2, column=1, sticky="w", padx=8, pady=8
         )
+        tk.Label(window, text="AI provider").grid(row=2, column=2, sticky="w", padx=(8, 16), pady=8)
+        provider_combo = ttk.Combobox(
+            window,
+            textvariable=self.ai_provider_var,
+            values=["openai", "ollama", "lmstudio"],
+            state="readonly",
+            width=18,
+        )
+        provider_combo.grid(row=3, column=2, sticky="ew", padx=(8, 16), pady=(0, 8))
 
         tk.Label(window, text="AI review threshold").grid(row=3, column=0, sticky="w", padx=16, pady=8)
         tk.Entry(window, textvariable=self.ai_review_threshold_var).grid(
@@ -1109,15 +1311,31 @@ class BatchRenamerApp:
         tk.Entry(api_frame, textvariable=self.api_url_var).grid(
             row=2, column=1, sticky="ew", padx=(8, 12), pady=(8, 12)
         )
-        tk.Button(api_frame, text="Test API", command=self.test_api_connection).grid(
-            row=3, column=0, sticky="ew", padx=12, pady=(0, 12)
+        tk.Label(api_frame, text="Local model").grid(row=3, column=0, sticky="w", padx=12, pady=(0, 8))
+        tk.Entry(api_frame, textvariable=self.ollama_model_var).grid(
+            row=3, column=1, sticky="ew", padx=(8, 12), pady=(0, 8)
+        )
+        tk.Label(api_frame, text="Local URL").grid(row=4, column=0, sticky="w", padx=12, pady=(0, 12))
+        tk.Entry(api_frame, textvariable=self.ollama_url_var).grid(
+            row=4, column=1, sticky="ew", padx=(8, 12), pady=(0, 12)
+        )
+        tk.Label(api_frame, text="LM Studio model").grid(row=5, column=0, sticky="w", padx=12, pady=(0, 8))
+        tk.Entry(api_frame, textvariable=self.lmstudio_model_var).grid(
+            row=5, column=1, sticky="ew", padx=(8, 12), pady=(0, 8)
+        )
+        tk.Label(api_frame, text="LM Studio URL").grid(row=6, column=0, sticky="w", padx=12, pady=(0, 12))
+        tk.Entry(api_frame, textvariable=self.lmstudio_url_var).grid(
+            row=6, column=1, sticky="ew", padx=(8, 12), pady=(0, 12)
+        )
+        tk.Button(api_frame, text="Test connection", command=self.test_api_connection).grid(
+            row=7, column=0, sticky="ew", padx=12, pady=(0, 12)
         )
         tk.Label(
             api_frame,
             textvariable=self.api_test_status_var,
             anchor="w",
             justify="left",
-        ).grid(row=3, column=1, sticky="ew", padx=(8, 12), pady=(0, 12))
+        ).grid(row=7, column=1, sticky="ew", padx=(8, 12), pady=(0, 12))
 
         manual_frame = tk.LabelFrame(window, text="Folder renaming")
         manual_frame.grid(row=6, column=0, columnspan=3, sticky="ew", padx=16, pady=(8, 8))
@@ -1332,11 +1550,16 @@ class BatchRenamerApp:
         self.config["document_reference_samples"] = self.document_reference_samples
         self.config["auto_rename"] = self.auto_rename_var.get()
         self.config["ai_agent_enabled"] = self.ai_agent_var.get()
+        self.config["ai_provider"] = self.ai_provider_var.get().strip() or DEFAULT_AI_PROVIDER
         self.config["ai_review_threshold"] = ai_review_threshold
         self.config["ai_auto_rename_threshold"] = ai_auto_threshold
         self.config["openai_api_key"] = self.api_key_var.get().strip()
         self.config["openai_model"] = self.api_model_var.get().strip() or DEFAULT_OPENAI_MODEL
         self.config["openai_responses_url"] = self.api_url_var.get().strip() or DEFAULT_OPENAI_RESPONSES_URL
+        self.config["ollama_model"] = self.ollama_model_var.get().strip() or DEFAULT_OLLAMA_MODEL
+        self.config["ollama_url"] = self.ollama_url_var.get().strip() or DEFAULT_OLLAMA_URL
+        self.config["lmstudio_model"] = self.lmstudio_model_var.get().strip() or DEFAULT_LMSTUDIO_MODEL
+        self.config["lmstudio_url"] = self.lmstudio_url_var.get().strip() or DEFAULT_LMSTUDIO_URL
         save_config(self.config)
 
     def prompt_reference_target(self) -> Optional[Tuple[str, str]]:
@@ -1394,45 +1617,79 @@ class BatchRenamerApp:
         return review_threshold, auto_threshold
 
     def use_ai_agent(self) -> bool:
-        return self.ai_agent_var.get() and bool(self.api_key_var.get().strip())
+        if not self.ai_agent_var.get():
+            return False
+        if self.ai_provider_var.get().strip() in {"ollama", "lmstudio"}:
+            return True
+        return bool(self.api_key_var.get().strip())
 
-    def api_settings(self) -> Tuple[str, str, str]:
+    def api_settings(self) -> Tuple[str, str, str, str]:
+        provider = self.ai_provider_var.get().strip() or DEFAULT_AI_PROVIDER
+        if provider == "ollama":
+            return (
+                provider,
+                "",
+                self.ollama_model_var.get().strip() or DEFAULT_OLLAMA_MODEL,
+                self.ollama_url_var.get().strip() or DEFAULT_OLLAMA_URL,
+            )
+        if provider == "lmstudio":
+            return (
+                provider,
+                "",
+                self.lmstudio_model_var.get().strip() or DEFAULT_LMSTUDIO_MODEL,
+                self.lmstudio_url_var.get().strip() or DEFAULT_LMSTUDIO_URL,
+            )
         return (
+            provider,
             self.api_key_var.get().strip(),
             self.api_model_var.get().strip() or DEFAULT_OPENAI_MODEL,
             self.api_url_var.get().strip() or DEFAULT_OPENAI_RESPONSES_URL,
         )
 
     def test_api_connection(self):
-        api_key, api_model, api_url = self.api_settings()
-        if not api_key:
-            self.api_test_status_var.set("API status: failed")
-            messagebox.showerror("API test", "Failed: API token is empty.")
-            return
-
-        request_body = {
-            "model": api_model,
-            "input": "Return the word successful.",
-            "reasoning": {"effort": "none"},
-            "text": {"verbosity": "low"},
-            "max_output_tokens": 16,
-        }
-
+        provider, api_key, api_model, api_url = self.api_settings()
         try:
-            response_payload = send_openai_responses_request(api_key, api_url, request_body, timeout=30)
-            response_text = extract_response_text(response_payload).strip()
+            if provider == "ollama":
+                request_body = {
+                    "model": api_model,
+                    "prompt": "Return only the word successful.",
+                    "stream": False,
+                }
+                response_payload = send_json_post_request(api_url, request_body, timeout=30)
+                response_text = str(response_payload.get("response", "")).strip()
+            elif provider == "lmstudio":
+                request_body = {
+                    "model": api_model,
+                    "input": "Return the word successful.",
+                    "text": {"verbosity": "low"},
+                    "max_output_tokens": 16,
+                }
+                response_payload = send_json_post_request(api_url, request_body, timeout=30)
+                response_text = extract_response_text(response_payload).strip()
+            else:
+                if not api_key:
+                    raise RuntimeError("API token is empty.")
+                request_body = {
+                    "model": api_model,
+                    "input": "Return the word successful.",
+                    "reasoning": {"effort": "none"},
+                    "text": {"verbosity": "low"},
+                    "max_output_tokens": 16,
+                }
+                response_payload = send_openai_responses_request(api_key, api_url, request_body, timeout=30)
+                response_text = extract_response_text(response_payload).strip()
         except Exception as exc:
             self.api_test_status_var.set("API status: failed")
-            messagebox.showerror("API test", f"Failed: {exc}")
+            messagebox.showerror("Connection test", f"Failed: {exc}")
             return
 
         if response_text:
             self.api_test_status_var.set("API status: successful")
-            messagebox.showinfo("API test", f"Successful: {response_text}")
+            messagebox.showinfo("Connection test", f"Successful: {response_text}")
             return
 
         self.api_test_status_var.set("API status: failed")
-        messagebox.showerror("API test", "Failed: empty response from API.")
+        messagebox.showerror("Connection test", "Failed: empty response from provider.")
 
     def select_folder(self):
         selected = filedialog.askdirectory(
@@ -1875,18 +2132,41 @@ class BatchRenamerApp:
                     continue
 
                 try:
-                    api_key, api_model, api_url = self.api_settings()
-                    decision = ask_ai_agent_to_classify(
-                        file_path,
-                        extracted_text,
-                        extraction_method,
-                        self.document_types,
-                        self.document_keywords,
-                        self.document_reference_samples,
-                        api_key,
-                        api_model,
-                        api_url,
-                    )
+                    provider, api_key, api_model, api_url = self.api_settings()
+                    if provider == "ollama":
+                        decision = ask_ollama_agent_to_classify(
+                            file_path,
+                            extracted_text,
+                            extraction_method,
+                            self.document_types,
+                            self.document_keywords,
+                            self.document_reference_samples,
+                            api_model,
+                            api_url,
+                        )
+                    elif provider == "lmstudio":
+                        decision = ask_lmstudio_agent_to_classify(
+                            file_path,
+                            extracted_text,
+                            extraction_method,
+                            self.document_types,
+                            self.document_keywords,
+                            self.document_reference_samples,
+                            api_model,
+                            api_url,
+                        )
+                    else:
+                        decision = ask_ai_agent_to_classify(
+                            file_path,
+                            extracted_text,
+                            extraction_method,
+                            self.document_types,
+                            self.document_keywords,
+                            self.document_reference_samples,
+                            api_key,
+                            api_model,
+                            api_url,
+                        )
                 except Exception as exc:
                     self.set_pending_detection_status(
                         key,

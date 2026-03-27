@@ -43,6 +43,7 @@ The interface lets you:
 - open a dedicated `Configuration` window for settings and API parameters
 - open a dedicated `Learn Files` window for study files and learned samples
 - optionally enable an AI agent workflow for autonomous routing and renaming review
+- choose between `openai`, `ollama`, and `lmstudio` as the AI provider
 - rename current files immediately
 - start or stop automatic monitoring
 
@@ -77,7 +78,7 @@ For scanned images and image-only PDFs, the app will try OCR through `tesseract`
 
 You can also train each document type from multiple real sample files. The app stores all learned references, lets you remove a bad sample, and uses the strongest matching examples to classify future scans.
 
-You can store the real API settings directly in the `Configuration` window, including the API token, model, and responses URL. The AI agent reads the extracted text, compares it with your learned references, auto-renames high-confidence files, and sends medium-confidence files to human review.
+You can store the real AI settings directly in the `Configuration` window, including the OpenAI token, a local Ollama endpoint, or a local LM Studio endpoint. The AI agent reads the extracted text, compares it with your learned references, auto-renames high-confidence files, and sends medium-confidence files to human review.
 
 ## Naming Format
 
@@ -194,3 +195,15 @@ Optional for the AI agent workflow:
 
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL` to override the default model (`gpt-5.4`)
+
+Optional for a local free workflow:
+
+- `ollama`
+- a local model such as `llama3.2:3b`
+- default local endpoint: `http://localhost:11434/api/generate`
+
+Optional for a local LM Studio workflow:
+
+- `LM Studio`
+- a loaded local chat model exposed through the local server
+- default LM Studio responses endpoint: `http://localhost:1234/v1/responses`
